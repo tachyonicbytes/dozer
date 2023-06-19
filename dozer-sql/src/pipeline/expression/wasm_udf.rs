@@ -3,17 +3,11 @@ use crate::pipeline::errors::PipelineError::UnsupportedSqlError;
 use crate::pipeline::errors::UnsupportedSqlError::GenericError;
 use crate::pipeline::expression::execution::{Expression, ExpressionExecutor};
 
-use dozer_types::types::{Field, FieldType, Record, Schema};
 use dozer_types::ordered_float::OrderedFloat;
-
-
+use dozer_types::types::{Field, FieldType, Record, Schema};
 use std::env;
 
-const MODULE_NAME: &str = "wasm_udf";
-
-
 use wasmtime::*;
-
 
 pub fn evaluate_wasm_udf(
     schema: &Schema,
@@ -31,8 +25,8 @@ pub fn evaluate_wasm_udf(
     let values2: Vec<Val> = values
         .iter()
         .map(|field| match field {
-            Field::Int(value) =>  Val::I64(*value),
-            Field::Float(value) =>  Val::F64(value.to_bits()),
+            Field::Int(value) => Val::I64(*value),
+            Field::Float(value) => Val::F64(value.to_bits()),
             _ => todo!(),
         })
         .collect();
@@ -47,14 +41,19 @@ pub fn evaluate_wasm_udf(
     let mut store = Store::new(&engine, 4);
     let instance = Instance::new(&mut store, &module, &[])?;
 
-    let wasm_udf_func = instance.get_func(&mut store, name).expect("export wasn't a function");
+    let wasm_udf_func = instance
+        .get_func(&mut store, name)
+        .expect("export wasn't a function");
     let mut results: [Val; 1] = [Val::I64(0)];
 
     // match wasm_udf_func.call(&mut store, &[Val::I64(9)], &mut results) {
     match wasm_udf_func.call(&mut store, &values2, &mut results) {
         Ok(()) => {}
         Err(trap) => {
-            panic!("execution of wasm_udf_func `{}` resulted in a wasm trap: {}", name, trap);
+            panic!(
+                "execution of wasm_udf_func `{}` resulted in a wasm trap: {}",
+                name, trap
+            );
         }
     }
 
