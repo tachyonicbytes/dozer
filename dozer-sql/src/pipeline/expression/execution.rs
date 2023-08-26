@@ -101,6 +101,12 @@ pub enum Expression {
         args: Vec<Expression>,
         return_type: FieldType,
     },
+    #[cfg(feature = "wasm")]
+    WasmUDF {
+        name: String,
+        args: Vec<Expression>,
+        return_type: FieldType,
+    },
 }
 
 impl Expression {
@@ -157,6 +163,18 @@ impl Expression {
             }
             #[cfg(feature = "python")]
             Expression::PythonUDF { name, args, .. } => {
+                name.to_string()
+                    + "("
+                    + args
+                        .iter()
+                        .map(|expr| expr.to_string(schema))
+                        .collect::<Vec<String>>()
+                        .join(",")
+                        .as_str()
+                    + ")"
+            }
+            #[cfg(feature = "wasm")]
+            Expression::WasmUDF { name, args, .. } => {
                 name.to_string()
                     + "("
                     + args
@@ -319,6 +337,16 @@ impl Expression {
                 use crate::pipeline::expression::python_udf::evaluate_py_udf;
                 evaluate_py_udf(schema, name, args, return_type, record)
             }
+            #[cfg(feature = "wasm")]
+            Expression::WasmUDF {
+                name,
+                args,
+                return_type,
+                ..
+            } => {
+                use crate::pipeline::expression::wasm_udf::evaluate_wasm_udf;
+                evaluate_wasm_udf(schema, name, args, return_type, record)
+            }
             Expression::UnaryOperator { operator, arg } => operator.evaluate(schema, arg, record),
             Expression::AggregateFunction { fun, args: _ } => {
                 Err(PipelineError::InvalidExpression(format!(
@@ -445,6 +473,13 @@ impl Expression {
             }
             #[cfg(feature = "python")]
             Expression::PythonUDF { return_type, .. } => Ok(ExpressionType::new(
+                *return_type,
+                false,
+                SourceDefinition::Dynamic,
+                false,
+            )),
+            #[cfg(feature = "wasm")]
+            Expression::WasmUDF { return_type, .. } => Ok(ExpressionType::new(
                 *return_type,
                 false,
                 SourceDefinition::Dynamic,

@@ -17,5 +17,7 @@ pub mod scalar;
 
 #[cfg(feature = "python")]
 pub mod python_udf;
+#[cfg(feature = "wasm")]
+pub mod wasm_udf;
 #[cfg(test)]
 mod tests;
