@@ -15,7 +15,6 @@ pub struct UdfConfig {
 pub enum UdfType {
     #[prost(message, tag = "2")]
     Onnx(OnnxConfig),
-    #[cfg(feature = "wasm")]
     #[prost(message, tag = "3")]
     Wasm(WasmConfig),
 }
