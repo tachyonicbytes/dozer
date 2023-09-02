@@ -11,8 +11,13 @@ use dozer_types::thiserror::Error;
 use dozer_types::types::{Field, FieldType};
 use std::fmt::{Display, Formatter};
 
+<<<<<<< HEAD
 #[cfg(feature = "onnx")]
 use crate::pipeline::onnx::OnnxError;
+=======
+#[cfg(feature = "wasm")]
+use wasmtime;
+>>>>>>> cf3a84e3 (Adds incipient support for wasm_udfs)
 
 #[derive(Debug, Clone)]
 pub struct FieldTypes {
@@ -103,6 +108,10 @@ pub enum PipelineError {
     #[error("Udf is defined but missing with config: {0}")]
     UdfConfigMissing(String),
 
+    #[cfg(feature = "wasm")]
+    #[error("Wasm Error: {0}")]
+    WasmErr(wasmtime::Error),
+
     // Error forwarding
     #[error("Internal type error: {0}")]
     InternalTypeError(#[from] TypeError),
@@ -189,6 +198,13 @@ pub enum PipelineError {
 impl From<dozer_types::pyo3::PyErr> for PipelineError {
     fn from(py_err: dozer_types::pyo3::PyErr) -> Self {
         PipelineError::PythonErr(py_err)
+    }
+}
+
+#[cfg(feature = "wasm")]
+impl From<wasmtime::Error> for PipelineError {
+    fn from(wasm_err: wasmtime::Error) -> Self {
+        PipelineError::WasmErr(wasm_err)
     }
 }
 
