@@ -11,13 +11,10 @@ use dozer_types::thiserror::Error;
 use dozer_types::types::{Field, FieldType};
 use std::fmt::{Display, Formatter};
 
-<<<<<<< HEAD
 #[cfg(feature = "onnx")]
 use crate::pipeline::onnx::OnnxError;
-=======
 #[cfg(feature = "wasm")]
 use wasmtime;
->>>>>>> cf3a84e3 (Adds incipient support for wasm_udfs)
 
 #[derive(Debug, Clone)]
 pub struct FieldTypes {
