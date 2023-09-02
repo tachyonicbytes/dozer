@@ -1,7 +1,7 @@
 use crate::pipeline::errors::PipelineError;
 use crate::pipeline::errors::PipelineError::UnsupportedSqlError;
 use crate::pipeline::errors::UnsupportedSqlError::GenericError;
-use crate::pipeline::expression::execution::{Expression, ExpressionExecutor};
+use crate::pipeline::expression::execution::Expression;
 
 use dozer_types::types::{Field, FieldType, Record, Schema};
 use dozer_types::ordered_float::OrderedFloat;
