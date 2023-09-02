@@ -15,11 +15,7 @@ pub struct UdfConfig {
 pub enum UdfType {
     #[prost(message, tag = "2")]
     Onnx(OnnxConfig),
-<<<<<<< HEAD
-=======
-
     #[cfg(feature = "wasm")]
->>>>>>> df214de6 (Add wasm_udfs to the new config)
     #[prost(message, tag = "3")]
     Wasm(WasmConfig),
 }
