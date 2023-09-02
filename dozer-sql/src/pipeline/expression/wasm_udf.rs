@@ -5,7 +5,6 @@ use crate::pipeline::expression::execution::Expression;
 
 use dozer_types::ordered_float::OrderedFloat;
 use dozer_types::types::{Field, FieldType, Record, Schema};
-use std::env;
 
 use wasmtime::*;
 
