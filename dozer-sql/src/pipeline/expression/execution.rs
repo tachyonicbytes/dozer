@@ -109,10 +109,10 @@ pub enum Expression {
         session: DozerSession,
         args: Vec<Expression>,
     },
-
     #[cfg(feature = "wasm")]
     WasmUDF {
         name: String,
+        module: String,
         args: Vec<Expression>,
         return_type: FieldType,
     },
@@ -371,12 +371,13 @@ impl Expression {
             #[cfg(feature = "wasm")]
             Expression::WasmUDF {
                 name,
+                module,
                 args,
                 return_type,
                 ..
             } => {
                 use crate::pipeline::expression::wasm_udf::evaluate_wasm_udf;
-                evaluate_wasm_udf(schema, name, args, return_type, record)
+                evaluate_wasm_udf(schema, name, module, args, return_type, record)
             }
             Expression::UnaryOperator { operator, arg } => operator.evaluate(schema, arg, record),
             Expression::AggregateFunction { fun, args: _ } => {

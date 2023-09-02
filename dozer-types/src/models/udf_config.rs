@@ -15,11 +15,20 @@ pub struct UdfConfig {
 pub enum UdfType {
     #[prost(message, tag = "2")]
     Onnx(OnnxConfig),
+    #[prost(message, tag = "3")]
+    Wasm(WasmConfig),
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message)]
 pub struct OnnxConfig {
     #[prost(string)]
     /// path to the model file
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message)]
+pub struct WasmConfig {
+    #[prost(string)]
+    /// path to the module file
     pub path: String,
 }

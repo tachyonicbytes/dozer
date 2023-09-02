@@ -38,6 +38,9 @@ use crate::pipeline::onnx::OnnxError::OnnxOrtErr;
 #[cfg(feature = "onnx")]
 use dozer_types::models::udf_config::OnnxConfig;
 
+#[cfg(feature = "wasm")]
+use dozer_types::models::udf_config::WasmConfig;
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct ExpressionBuilder {
     // Must be an aggregation function
@@ -470,12 +473,12 @@ impl ExpressionBuilder {
             return self.parse_python_udf(udf_name, sql_function, schema, udfs);
         }
 
-        #[cfg(feature = "wasm")]
-        if function_name.starts_with("wasm_") {
-            // The function is from wasm udf.
-            let udf_name = function_name.strip_prefix("wasm_").unwrap();
-            return self.parse_wasm_udf(udf_name, sql_function, schema);
-        }
+        // #[cfg(feature = "wasm")]
+        // if function_name.starts_with("wasm_") {
+        //     // The function is from wasm udf.
+        //     let udf_name = function_name.strip_prefix("wasm_").unwrap();
+        //     return self.parse_wasm_udf(udf_name, sql_function, schema, udfs);
+        // }
 
         let aggr_check = self.aggr_function_check(
             function_name.clone(),
@@ -558,6 +561,25 @@ impl ExpressionBuilder {
                         let _ = config;
                         Err(PipelineError::OnnxNotEnabled)
                     }
+                }
+                Some(UdfType::Wasm(config)) => {
+                    #[cfg(feature = "wasm")]
+                    {
+                        self.parse_wasm_udf(
+                            function_name.clone(),
+                            config,
+                            sql_function,
+                            schema,
+                            udfs,
+                        )
+                    }
+
+                    #[cfg(not(feature = "wasm"))]
+                    {
+                        let _ = config;
+                        Err(PipelineError::WasmNotEnabled)
+                    }
+
                 }
                 None => Err(PipelineError::UdfConfigMissing(function_name.clone())),
             };
@@ -941,14 +963,14 @@ impl ExpressionBuilder {
     #[cfg(feature = "wasm")]
     fn parse_wasm_udf(
         &mut self,
-        name: &str,
+        name: String,
+        config: &WasmConfig,
         function: &Function,
         schema: &Schema,
         udfs: &[UdfConfig],
     ) -> Result<Expression, PipelineError> {
         // First, get the wasm function defined by name.
         // Then, transfer the wasm function to Expression::WasmUDF
-
         use dozer_types::types::FieldType;
         use PipelineError::InvalidQuery;
 
@@ -958,19 +980,30 @@ impl ExpressionBuilder {
             .map(|argument| self.parse_sql_function_arg(false, argument, schema, udfs))
             .collect::<Result<Vec<_>, PipelineError>>()?;
 
-        let last_arg = args
-            .last()
-            .ok_or_else(|| InvalidQuery("Can't get wasm udf return type".to_string()))?;
+        // let last_arg = args
+        //     .last()
+        //     .ok_or_else(|| InvalidQuery("Can't get wasm udf return type".to_string()))?;
 
-        let return_type = match last_arg {
-            Expression::Literal(Field::String(s)) => {
-                FieldType::try_from(s.as_str()).map_err(|e| InvalidQuery(format!("Failed to parse Wasm UDF return type: {e}")))?
-            }
-            _ => return Err(InvalidArgument("The last arg for wasm udf should be a string literal, which represents return type".to_string())),
+        // let return_type = match last_arg {
+        //     Expression::Literal(Field::String(s)) => {
+        //         FieldType::try_from(s.as_str()).map_err(|e| InvalidQuery(format!("Failed to parse Wasm UDF return type: {e}")))?
+        //     }
+        //     _ => return Err(InvalidArgument("The last arg for wasm udf should be a string literal, which represents return type".to_string())),
+        // };
+
+        let return_type = {
+            let ident = function
+                .return_type
+                .as_ref()
+                .ok_or_else(|| InvalidQuery("Wasm UDF must have a return type. The syntax is: function_name<return_type>(arguments)".to_string()))?;
+
+            FieldType::try_from(ident.value.as_str())
+                .map_err(|e| InvalidQuery(format!("Failed to parse Wasm UDF return type: {e}")))?
         };
 
         Ok(Expression::WasmUDF {
             name: name.to_string(),
+            module: config.path.clone(),
             args,
             return_type,
         })

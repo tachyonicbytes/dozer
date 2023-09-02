@@ -6,25 +6,19 @@ use crate::pipeline::expression::execution::Expression;
 use dozer_types::types::{Field, FieldType, Record, Schema};
 use dozer_types::ordered_float::OrderedFloat;
 
-
-use std::env;
-
-const MODULE_NAME: &str = "wasm_udf";
-
-
 use wasmtime::*;
 
 
 pub fn evaluate_wasm_udf(
     schema: &Schema,
     name: &str,
+    module: &str,
     args: &[Expression],
     return_type: &FieldType,
     record: &Record,
 ) -> Result<Field, PipelineError> {
     let values = args
         .iter()
-        .take(args.len() - 1)
         .map(|arg| arg.evaluate(record, schema))
         .collect::<Result<Vec<_>, PipelineError>>()?;
 
@@ -39,15 +33,13 @@ pub fn evaluate_wasm_udf(
 
     let engine = Engine::default();
 
-    let env_path = env::var("DOZER_WASM_UDF").map_err(|_| {
-        PipelineError::InvalidFunction("Missing 'DOZER_WASM_UDF' environment var".to_string())
-    })?;
-
-    let module = Module::from_file(&engine, env_path)?;
+    let module = Module::from_file(&engine, module)?;
     let mut store = Store::new(&engine, 4);
     let instance = Instance::new(&mut store, &module, &[])?;
 
     let wasm_udf_func = instance.get_func(&mut store, name).expect("export wasn't a function");
+
+    // Create an empty array of length 1 to store the results
     let mut results: [Val; 1] = [Val::I64(0)];
 
     // match wasm_udf_func.call(&mut store, &[Val::I64(9)], &mut results) {
