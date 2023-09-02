@@ -5,7 +5,7 @@ pub struct UdfConfig {
     #[prost(string, tag = "1")]
     /// name of the model function
     pub name: String,
-    #[prost(oneof = "UdfType", tags = "2")]
+    #[prost(oneof = "UdfType", tags = "2, 3")]
     #[serde(skip_serializing_if = "Option::is_none")]
     /// setting for what type of udf to use; Default: Onnx
     pub config: Option<UdfType>,
@@ -15,6 +15,11 @@ pub struct UdfConfig {
 pub enum UdfType {
     #[prost(message, tag = "2")]
     Onnx(OnnxConfig),
+<<<<<<< HEAD
+=======
+
+    #[cfg(feature = "wasm")]
+>>>>>>> df214de6 (Add wasm_udfs to the new config)
     #[prost(message, tag = "3")]
     Wasm(WasmConfig),
 }
