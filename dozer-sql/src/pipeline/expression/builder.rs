@@ -473,13 +473,6 @@ impl ExpressionBuilder {
             return self.parse_python_udf(udf_name, sql_function, schema, udfs);
         }
 
-        // #[cfg(feature = "wasm")]
-        // if function_name.starts_with("wasm_") {
-        //     // The function is from wasm udf.
-        //     let udf_name = function_name.strip_prefix("wasm_").unwrap();
-        //     return self.parse_wasm_udf(udf_name, sql_function, schema, udfs);
-        // }
-
         let aggr_check = self.aggr_function_check(
             function_name.clone(),
             parse_aggregations,
@@ -979,17 +972,6 @@ impl ExpressionBuilder {
             .iter()
             .map(|argument| self.parse_sql_function_arg(false, argument, schema, udfs))
             .collect::<Result<Vec<_>, PipelineError>>()?;
-
-        // let last_arg = args
-        //     .last()
-        //     .ok_or_else(|| InvalidQuery("Can't get wasm udf return type".to_string()))?;
-
-        // let return_type = match last_arg {
-        //     Expression::Literal(Field::String(s)) => {
-        //         FieldType::try_from(s.as_str()).map_err(|e| InvalidQuery(format!("Failed to parse Wasm UDF return type: {e}")))?
-        //     }
-        //     _ => return Err(InvalidArgument("The last arg for wasm udf should be a string literal, which represents return type".to_string())),
-        // };
 
         let return_type = {
             let ident = function
