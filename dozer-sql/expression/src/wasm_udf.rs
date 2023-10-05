@@ -8,6 +8,16 @@ use dozer_types::types::{Field, FieldType, Record, Schema};
 
 use wasmtime::*;
 
+pub enum Error {
+    #[error(
+        "Wasm UDF must have a return type. The syntax is: function_name<return_type>(arguments)"
+    )]
+    MissingReturnType,
+    #[error("wasmtime error: {0}")]
+    WasmTime(#[from] wasmtime::Error),
+}
+
+
 pub fn evaluate_wasm_udf(
     schema: &Schema,
     name: &str,

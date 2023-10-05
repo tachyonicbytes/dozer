@@ -25,7 +25,7 @@ pub struct OnnxConfig {
     pub path: String,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Eq, PartialEq, Clone)]
 pub struct WasmConfig {
     /// path to the module file
     pub path: String,
