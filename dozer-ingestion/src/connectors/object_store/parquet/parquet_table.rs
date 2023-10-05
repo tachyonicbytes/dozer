@@ -10,7 +10,8 @@ use deltalake::{
     Path as DeltaPath,
 };
 
-use dozer_types::ingestion_types::IngestionMessageKind;
+use dozer_types::ingestion_types::IngestionMessage;
+use dozer_types::tonic::async_trait;
 use dozer_types::{
     chrono::{DateTime, Utc},
     ingestion_types::ParquetConfig,
@@ -21,7 +22,6 @@ use object_store::ObjectStore;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
-use tonic::async_trait;
 
 use crate::connectors::object_store::helper::is_marker_file_exist;
 use crate::{
@@ -53,7 +53,7 @@ impl<T: DozerObjectStore + Send> ParquetTable<T> {
         &self,
         table_index: usize,
         table: &TableInfo,
-        sender: Sender<Result<Option<IngestionMessageKind>, ObjectStoreConnectorError>>,
+        sender: Sender<Result<Option<IngestionMessage>, ObjectStoreConnectorError>>,
     ) -> Result<(), ConnectorError> {
         let params = self.store_config.table_params(&table.name)?;
         let store = Arc::new(params.object_store);
@@ -74,10 +74,6 @@ impl<T: DozerObjectStore + Send> ParquetTable<T> {
         // Get the table state after snapshot
         let mut update_state = self.update_state.clone();
         let extension = self.table_config.extension.clone();
-        let marker_extension = match self.table_config.marker_file {
-            true => self.table_config.marker_extension.clone(),
-            false => String::new(),
-        };
 
         loop {
             // List objects in the S3 bucket with the specified prefix
@@ -132,30 +128,34 @@ impl<T: DozerObjectStore + Send> ParquetTable<T> {
                             name: base_path.clone() + new_path_str,
                             last_modified: object.last_modified.timestamp(),
                         });
-                        if marker_extension.is_empty() {
+                        if self.table_config.marker_extension.is_none() {
                             update_state.insert(object.location, object.last_modified);
                         }
-                    } else if file_path.ends_with(marker_extension.as_str())
-                        && !marker_extension.is_empty()
+                    } else if let Some(marker_extension) =
+                        self.table_config.marker_extension.as_deref()
                     {
-                        // Scenario 3: New marker file added
-                        info!(
-                            "Source Object Marker has been added: {:?}, {:?}",
-                            object.location, object.last_modified
-                        );
+                        if file_path.ends_with(marker_extension) {
+                            // Scenario 3: New marker file added
+                            info!(
+                                "Source Object Marker has been added: {:?}, {:?}",
+                                object.location, object.last_modified
+                            );
 
-                        // Remove base folder from relative path
-                        let path = Path::new(&file_path);
-                        let new_path = path
-                            .strip_prefix(path.components().next().unwrap())
-                            .unwrap();
-                        let new_path_str = new_path.to_str().unwrap();
+                            // Remove base folder from relative path
+                            let path = Path::new(&file_path);
+                            let new_path = path
+                                .strip_prefix(path.components().next().unwrap())
+                                .unwrap();
+                            let new_path_str = new_path.to_str().unwrap();
 
-                        new_marker_files.push(FileInfo {
-                            name: base_path.clone() + new_path_str,
-                            last_modified: object.last_modified.timestamp(),
-                        });
-                        update_state.insert(object.location, object.last_modified);
+                            new_marker_files.push(FileInfo {
+                                name: base_path.clone() + new_path_str,
+                                last_modified: object.last_modified.timestamp(),
+                            });
+                            update_state.insert(object.location, object.last_modified);
+                        } else {
+                            continue;
+                        }
                     } else {
                         // Skip files that do not match the extension nor marker extension
                         continue;
@@ -166,8 +166,7 @@ impl<T: DozerObjectStore + Send> ParquetTable<T> {
             new_files.sort();
             for file in &new_files {
                 let marker_file_exist = is_marker_file_exist(new_marker_files.clone(), file);
-                let use_marker_file = marker_extension.is_empty();
-                if !marker_file_exist && !use_marker_file {
+                if !marker_file_exist && self.table_config.marker_extension.is_some() {
                     continue;
                 } else {
                     let file_path = ListingTableUrl::parse(&file.name)
@@ -208,7 +207,7 @@ impl<T: DozerObjectStore + Send> TableWatcher for ParquetTable<T> {
         &self,
         table_index: usize,
         table: &TableInfo,
-        sender: Sender<Result<Option<IngestionMessageKind>, ObjectStoreConnectorError>>,
+        sender: Sender<Result<Option<IngestionMessage>, ObjectStoreConnectorError>>,
     ) -> Result<JoinHandle<(usize, HashMap<object_store::path::Path, DateTime<Utc>>)>, ConnectorError>
     {
         let params = self.store_config.table_params(&table.name)?;
@@ -230,10 +229,7 @@ impl<T: DozerObjectStore + Send> TableWatcher for ParquetTable<T> {
         // Get the table state after snapshot
         let mut update_state = self.update_state.clone();
         let extension = self.table_config.extension.clone();
-        let marker_extension = match self.table_config.marker_file {
-            true => self.table_config.marker_extension.clone(),
-            false => String::new(),
-        };
+        let marker_extension = self.table_config.marker_extension.clone();
 
         let h = tokio::spawn(async move {
             // List objects in the S3 bucket with the specified prefix
@@ -288,31 +284,33 @@ impl<T: DozerObjectStore + Send> TableWatcher for ParquetTable<T> {
                             name: base_path.clone() + new_path_str,
                             last_modified: object.last_modified.timestamp(),
                         });
-                        if marker_extension.is_empty() {
+                        if marker_extension.is_none() {
                             update_state.insert(object.location, object.last_modified);
                         }
-                    } else if file_path.ends_with(marker_extension.as_str())
-                        && !marker_extension.is_empty()
-                    {
-                        // Scenario 3: New marker file added
-                        info!(
-                            "Source Object Marker has been added: {:?}, {:?}",
-                            object.location, object.last_modified
-                        );
+                    } else if let Some(marker_extension) = marker_extension.as_deref() {
+                        if file_path.ends_with(marker_extension) {
+                            // Scenario 3: New marker file added
+                            info!(
+                                "Source Object Marker has been added: {:?}, {:?}",
+                                object.location, object.last_modified
+                            );
 
-                        // Remove base folder from relative path
-                        let path = Path::new(&file_path);
-                        let new_path = path
-                            .strip_prefix(path.components().next().unwrap())
-                            .unwrap();
-                        let new_path_str = new_path.to_str().unwrap();
+                            // Remove base folder from relative path
+                            let path = Path::new(&file_path);
+                            let new_path = path
+                                .strip_prefix(path.components().next().unwrap())
+                                .unwrap();
+                            let new_path_str = new_path.to_str().unwrap();
 
-                        new_marker_files.push(FileInfo {
-                            name: base_path.clone() + new_path_str,
-                            last_modified: object.last_modified.timestamp(),
-                        });
+                            new_marker_files.push(FileInfo {
+                                name: base_path.clone() + new_path_str,
+                                last_modified: object.last_modified.timestamp(),
+                            });
 
-                        update_state.insert(object.location, object.last_modified);
+                            update_state.insert(object.location, object.last_modified);
+                        } else {
+                            continue;
+                        }
                     } else {
                         // Skip files that do not match the extension nor marker extension
                         continue;
@@ -323,8 +321,7 @@ impl<T: DozerObjectStore + Send> TableWatcher for ParquetTable<T> {
             new_files.sort();
             for file in &new_files {
                 let marker_file_exist = is_marker_file_exist(new_marker_files.clone(), file);
-                let use_marker_file = marker_extension.is_empty();
-                if !marker_file_exist && !use_marker_file {
+                if !marker_file_exist && marker_extension.is_some() {
                     continue;
                 } else {
                     let file_path = ListingTableUrl::parse(&file.name)
@@ -362,7 +359,7 @@ impl<T: DozerObjectStore + Send> TableWatcher for ParquetTable<T> {
         &self,
         table_index: usize,
         table: &TableInfo,
-        sender: Sender<Result<Option<IngestionMessageKind>, ObjectStoreConnectorError>>,
+        sender: Sender<Result<Option<IngestionMessage>, ObjectStoreConnectorError>>,
     ) -> Result<(), ConnectorError> {
         self.read(table_index, table, sender).await?;
         Ok(())

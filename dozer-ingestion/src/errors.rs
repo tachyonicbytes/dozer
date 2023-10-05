@@ -1,9 +1,9 @@
 #![allow(clippy::enum_variant_names)]
 
+use deltalake::arrow::error::ArrowError;
 use dozer_log::errors::{ReaderBuilderError, ReaderError};
 use dozer_types::errors::internal::BoxedError;
 use dozer_types::errors::types::{DeserializationError, SerializationError, TypeError};
-use dozer_types::ingestion_types::IngestorError;
 use dozer_types::thiserror;
 use dozer_types::thiserror::Error;
 use dozer_types::{bincode, serde_json};
@@ -39,9 +39,6 @@ use crate::connectors::mongodb::MongodbConnectorError;
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
-    #[error("Missing `config` for connector {0}")]
-    MissingConfiguration(String),
-
     #[error("Failed to map configuration: {0}")]
     WrongConnectionConfiguration(DeserializationError),
 
@@ -51,8 +48,10 @@ pub enum ConnectorError {
     #[error("Failed to map configuration: {0}")]
     UnableToInferSchema(DataFusionError),
 
-    #[error("Unsupported grpc adapter: {0} {1}")]
-    UnsupportedGrpcAdapter(String, String),
+    #[error("Unsupported grpc adapter: {0} {1:?}")]
+    UnsupportedGrpcAdapter(String, Option<String>),
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] ArrowError),
 
     #[error("Table not found: {0}")]
     TableNotFound(String),
@@ -97,7 +96,7 @@ pub enum ConnectorError {
     InternalError(#[from] BoxedError),
 
     #[error("Failed to send message on channel")]
-    IngestorError(#[source] IngestorError),
+    IngestorError,
 
     #[cfg(feature = "ethereum")]
     #[error("Error in Eth Connection: {0}")]
@@ -114,6 +113,9 @@ pub enum ConnectorError {
 
     #[error("Datafusion error: {0}")]
     DataFusionError(#[from] DataFusionError),
+
+    #[error("snowflake feature is not enabled")]
+    SnowflakeFeatureNotEnabled,
 
     #[error("kafka feature is not enabled")]
     KafkaFeatureNotEnabled,
@@ -149,11 +151,11 @@ pub enum ConfigurationError {
 }
 #[derive(Error, Debug)]
 pub enum NestedDozerConnectorError {
-    #[error("Failed to connect to upstream dozer app. {0}")]
-    ConnectionError(#[source] tonic::transport::Error),
+    #[error("Failed to connect to upstream dozer at {0}: {1:?}")]
+    ConnectionError(String, #[source] dozer_types::tonic::transport::Error),
 
-    #[error("Failed to query endpoints from upstream dozer app. {0}")]
-    DescribeEndpointsError(#[source] tonic::Status),
+    #[error("Failed to query endpoints from upstream dozer app: {0}")]
+    DescribeEndpointsError(#[source] dozer_types::tonic::Status),
 
     #[error(transparent)]
     ReaderError(#[from] ReaderError),
@@ -341,7 +343,7 @@ pub enum SnowflakeError {
     QueryError(#[source] Box<DiagnosticRecord>),
 
     #[error("Snowflake connection error")]
-    ConnectionError(#[from] Box<DiagnosticRecord>),
+    ConnectionError(#[source] Box<DiagnosticRecord>),
 
     #[cfg(feature = "snowflake")]
     #[error(transparent)]
@@ -349,6 +351,9 @@ pub enum SnowflakeError {
 
     #[error(transparent)]
     SnowflakeStreamError(#[from] SnowflakeStreamError),
+
+    #[error("A network error occurred, but this query is not resumable. query: {0}")]
+    NonResumableQuery(String),
 }
 
 #[cfg(feature = "snowflake")]
@@ -474,9 +479,6 @@ pub enum ObjectStoreConnectorError {
 
     #[error(transparent)]
     TableReaderError(#[from] ObjectStoreTableReaderError),
-
-    #[error(transparent)]
-    IngestorError(#[from] IngestorError),
 
     #[error(transparent)]
     FromArrowError(#[from] FromArrowError),

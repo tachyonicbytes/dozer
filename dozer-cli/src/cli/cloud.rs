@@ -4,7 +4,7 @@ use clap::ArgAction;
 use dozer_types::grpc_types::cloud::Secret;
 use std::error::Error;
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Cloud {
     #[arg(global = true, short = 't', long)]
@@ -56,26 +56,31 @@ pub enum CloudCommands {
     },
     /// List all dozer application in Dozer Cloud
     List(ListCommandArgs),
-    /// Dozer API server management
-    #[command(subcommand)]
-    Api(ApiCommand),
     /// Dozer app secrets management
     #[command(subcommand)]
     Secrets(SecretsCommand),
+    /// Get example of API call
+    #[command(name = "api-request-samples")]
+    ApiRequestSamples {
+        #[arg(long, short)]
+        endpoint: Option<String>,
+    },
 }
 
 #[derive(Debug, Args, Clone)]
 pub struct DeployCommandArgs {
-    /// Number of replicas to serve Dozer APIs
-    #[arg(short, long)]
-    pub num_api_instances: Option<i32>,
-
     /// List of secrets which will be used in deployment
     #[arg(short, long, value_parser = parse_key_val)]
     pub secrets: Vec<Secret>,
 
     #[arg(long = "no-lock", action = ArgAction::SetFalse)]
     pub locked: bool,
+
+    #[arg(long = "allow-incompatible")]
+    pub allow_incompatible: bool,
+
+    #[arg(long = "follow")]
+    pub follow: bool,
 }
 
 pub fn default_num_api_instances() -> i32 {
@@ -88,9 +93,9 @@ pub struct LogCommandArgs {
     #[arg(short, long)]
     pub follow: bool,
 
-    /// The deployment to inspect
+    /// The version to inspect
     #[arg(short, long)]
-    pub deployment: Option<u32>,
+    pub version: Option<u32>,
 
     /// Ignore app logs
     #[arg(long, default_value = "false", action=ArgAction::SetTrue)]
@@ -126,16 +131,6 @@ pub struct ListCommandArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum VersionCommand {
-    /// Inspects the status of a version, compared to the current version if it's not current.
-    Status {
-        /// The version to inspect
-        version: u32,
-    },
-    /// Creates a new version of the application with the given deployment
-    Create {
-        /// The deployment of the application to create a new version from
-        deployment: u32,
-    },
     /// Sets a version as the "current" version of the application
     ///
     /// Current version of an application can be visited without the "/v<version>" prefix.
@@ -143,15 +138,16 @@ pub enum VersionCommand {
         /// The version to set as current
         version: u32,
     },
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum ApiCommand {
-    /// Sets the number of replicas to serve Dozer APIs
-    SetNumApiInstances {
-        /// The number of replicas to set
-        num_api_instances: i32,
-    },
+    /// Deletes a version
+    ///
+    /// This will  delete any resources related to the version, including any
+    /// aliases pointing to this version.
+    Delete { version: u32 },
+    /// Creates or updates an alias to point at the given version
+    Alias { alias: String, version: u32 },
+    /// Remove alias
+    #[command(name = "rm-alias", visible_alias = "rma")]
+    RmAlias { alias: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]

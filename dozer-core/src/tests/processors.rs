@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
+use dozer_recordstore::ProcessorRecordStoreDeserializer;
 use dozer_types::{errors::internal::BoxedError, types::Schema};
 
 use crate::{
     node::{OutputPortDef, OutputPortType, PortHandle, Processor, ProcessorFactory},
-    processor_record::ProcessorRecordStore,
     DEFAULT_PORT_HANDLE,
 };
 
@@ -40,7 +40,8 @@ impl ProcessorFactory for ConnectivityTestProcessorFactory {
         &self,
         _input_schemas: HashMap<PortHandle, Schema>,
         _output_schemas: HashMap<PortHandle, Schema>,
-        _record_store: &ProcessorRecordStore,
+        _record_store: &ProcessorRecordStoreDeserializer,
+        _checkpoint_data: Option<Vec<u8>>,
     ) -> Result<Box<dyn Processor>, BoxedError> {
         unimplemented!(
             "This struct is for connectivity test, only input and output ports are defined"
@@ -81,7 +82,8 @@ impl ProcessorFactory for NoInputPortProcessorFactory {
         &self,
         _input_schemas: HashMap<PortHandle, Schema>,
         _output_schemas: HashMap<PortHandle, Schema>,
-        _record_store: &ProcessorRecordStore,
+        _record_store: &ProcessorRecordStoreDeserializer,
+        _checkpoint_data: Option<Vec<u8>>,
     ) -> Result<Box<dyn Processor>, BoxedError> {
         unimplemented!(
             "This struct is for connectivity test, only input and output ports are defined"

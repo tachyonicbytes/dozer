@@ -1,15 +1,14 @@
 use super::super::helper as conn_helper;
 use super::helper::{self, get_block_traces, map_trace_to_ops};
-use crate::connectors::{table_name, CdcType, SourceSchema, SourceSchemaResult, TableIdentifier};
-use crate::{
-    connectors::{Connector, TableInfo},
-    errors::ConnectorError,
-    ingestion::Ingestor,
+use crate::connectors::{
+    table_name, CdcType, Connector, SourceSchema, SourceSchemaResult, TableIdentifier,
+    TableToIngest,
 };
-use dozer_types::ingestion_types::{EthTraceConfig, IngestionMessage};
+use crate::{connectors::TableInfo, errors::ConnectorError, ingestion::Ingestor};
+use dozer_types::ingestion_types::{default_batch_size, EthTraceConfig, IngestionMessage};
 use dozer_types::log::{error, info, warn};
 
-use tonic::async_trait;
+use dozer_types::tonic::async_trait;
 
 #[derive(Debug)]
 pub struct EthTraceConnector {
@@ -96,7 +95,7 @@ impl Connector for EthTraceConnector {
     async fn start(
         &self,
         ingestor: &Ingestor,
-        _tables: Vec<TableInfo>,
+        _tables: Vec<TableToIngest>,
     ) -> Result<(), ConnectorError> {
         let config = self.config.clone();
         let conn_name = self.conn_name.clone();
@@ -129,7 +128,11 @@ pub async fn run(
         "Starting Eth Trace connector: {} from block {}",
         conn_name, config.from_block
     );
-    let batch_iter = BatchIterator::new(config.from_block, config.to_block, config.batch_size);
+    let batch_iter = BatchIterator::new(
+        config.from_block,
+        config.to_block,
+        config.batch_size.unwrap_or_else(default_batch_size),
+    );
 
     let mut errors: Vec<ConnectorError> = vec![];
     for batch in batch_iter {
@@ -147,11 +150,13 @@ pub async fn run(
 
                         for op in ops {
                             ingestor
-                                .handle_message(IngestionMessage::new_op(
-                                    batch.0, 0, // We have only one table
-                                    0, op,
-                                ))
-                                .map_err(ConnectorError::IngestorError)?;
+                                .handle_message(IngestionMessage::OperationEvent {
+                                    table_index: 0, // We have only one table
+                                    op,
+                                    id: None,
+                                })
+                                .await
+                                .map_err(|_| ConnectorError::IngestorError)?;
                         }
                     }
 

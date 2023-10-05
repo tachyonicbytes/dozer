@@ -1,10 +1,9 @@
 use crate::channels::ProcessorChannelForwarder;
-use crate::checkpoint::create_checkpoint_factory_for_test;
+use crate::checkpoint::create_checkpoint_for_test;
 use crate::epoch::Epoch;
-use crate::executor::{DagExecutor, ExecutorOptions};
+use crate::executor::DagExecutor;
 use crate::executor_operation::ProcessorOperation;
 use crate::node::{OutputPortDef, OutputPortType, PortHandle, Processor, ProcessorFactory};
-use crate::processor_record::ProcessorRecordStore;
 use crate::tests::sinks::{CountingSinkFactory, COUNTING_SINK_INPUT_PORT};
 use crate::tests::sources::{
     DualPortGeneratorSourceFactory, GeneratorSourceFactory,
@@ -12,7 +11,9 @@ use crate::tests::sources::{
     GENERATOR_SOURCE_OUTPUT_PORT,
 };
 use crate::{Dag, Endpoint, DEFAULT_PORT_HANDLE};
+use dozer_log::storage::Object;
 use dozer_log::tokio;
+use dozer_recordstore::{ProcessorRecordStore, ProcessorRecordStoreDeserializer};
 use dozer_types::errors::internal::BoxedError;
 use dozer_types::node::NodeHandle;
 use dozer_types::types::Schema;
@@ -54,7 +55,8 @@ impl ProcessorFactory for NoopProcessorFactory {
         &self,
         _input_schemas: HashMap<PortHandle, Schema>,
         _output_schemas: HashMap<PortHandle, Schema>,
-        _record_store: &ProcessorRecordStore,
+        _record_store: &ProcessorRecordStoreDeserializer,
+        _checkpoint_data: Option<Vec<u8>>,
     ) -> Result<Box<dyn Processor>, BoxedError> {
         Ok(Box::new(NoopProcessor {}))
     }
@@ -80,6 +82,14 @@ impl Processor for NoopProcessor {
         fw: &mut dyn ProcessorChannelForwarder,
     ) -> Result<(), BoxedError> {
         fw.send(op, DEFAULT_PORT_HANDLE);
+        Ok(())
+    }
+
+    fn serialize(
+        &mut self,
+        _record_store: &ProcessorRecordStore,
+        _object: Object,
+    ) -> Result<(), BoxedError> {
         Ok(())
     }
 }
@@ -117,8 +127,9 @@ async fn test_run_dag() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()
@@ -160,8 +171,9 @@ async fn test_run_dag_and_stop() {
     .unwrap();
 
     let running = Arc::new(AtomicBool::new(true));
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    let join_handle = DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    let join_handle = DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(running.clone(), Default::default())
         .unwrap();
@@ -205,7 +217,8 @@ impl ProcessorFactory for NoopJoinProcessorFactory {
         &self,
         _input_schemas: HashMap<PortHandle, Schema>,
         _output_schemas: HashMap<PortHandle, Schema>,
-        _record_store: &ProcessorRecordStore,
+        _record_store: &ProcessorRecordStoreDeserializer,
+        _checkpoint_data: Option<Vec<u8>>,
     ) -> Result<Box<dyn Processor>, BoxedError> {
         Ok(Box::new(NoopJoinProcessor {}))
     }
@@ -231,6 +244,14 @@ impl Processor for NoopJoinProcessor {
         fw: &mut dyn ProcessorChannelForwarder,
     ) -> Result<(), BoxedError> {
         fw.send(op, DEFAULT_PORT_HANDLE);
+        Ok(())
+    }
+
+    fn serialize(
+        &mut self,
+        _record_store: &ProcessorRecordStore,
+        _object: Object,
+    ) -> Result<(), BoxedError> {
         Ok(())
     }
 }
@@ -280,8 +301,9 @@ async fn test_run_dag_2_sources_stateless() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()
@@ -334,8 +356,9 @@ async fn test_run_dag_2_sources_stateful() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()
@@ -389,8 +412,9 @@ async fn test_run_dag_1_source_2_ports_stateless() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()

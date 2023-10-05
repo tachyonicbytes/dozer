@@ -8,10 +8,11 @@ use crate::node::PortHandle;
 use crate::record_store::{RecordWriter, RecordWriterError};
 
 use crossbeam::channel::Sender;
-use dozer_types::ingestion_types::{IngestionMessage, IngestionMessageKind};
+use dozer_types::ingestion_types::IngestionMessage;
 use dozer_types::log::debug;
-use dozer_types::node::NodeHandle;
+use dozer_types::node::{NodeHandle, TableState};
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -103,7 +104,12 @@ impl ChannelManager {
     }
 
     fn send_commit(&mut self, epoch: &Epoch) -> Result<(), ExecutionError> {
-        debug!("[{}] Checkpointing - {}", self.owner, &epoch);
+        debug!(
+            "[{}] Checkpointing - {}: {:?}",
+            self.owner,
+            epoch.common_info.id,
+            epoch.common_info.source_states.deref()
+        );
 
         for senders in &self.senders {
             for sender in senders.1 {
@@ -133,9 +139,9 @@ impl ChannelManager {
 #[derive(Debug)]
 pub(crate) struct SourceChannelManager {
     source_handle: NodeHandle,
+    port_names: HashMap<PortHandle, String>,
     manager: ChannelManager,
-    curr_txid: u64,
-    curr_seq_in_tx: u64,
+    current_op_ids: HashMap<String, TableState>,
     commit_sz: u32,
     num_uncommitted_ops: u32,
     max_duration_between_commits: Duration,
@@ -144,8 +150,10 @@ pub(crate) struct SourceChannelManager {
 }
 
 impl SourceChannelManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         owner: NodeHandle,
+        port_names: HashMap<PortHandle, String>,
         senders: HashMap<PortHandle, Vec<Sender<ExecutorOperation>>>,
         state_writer: Option<StateWriter>,
         commit_sz: u32,
@@ -153,11 +161,16 @@ impl SourceChannelManager {
         epoch_manager: Arc<EpochManager>,
         error_manager: Arc<ErrorManager>,
     ) -> Self {
+        // FIXME: Read current_op_id from persisted state.
+        let current_op_ids = port_names
+            .values()
+            .map(|n| (n.clone(), TableState::NotStarted))
+            .collect();
+
         Self {
             manager: ChannelManager::new(owner.clone(), senders, state_writer, error_manager),
-            // FIXME: Read curr_txid and curr_seq_in_tx from persisted state.
-            curr_txid: 0,
-            curr_seq_in_tx: 0,
+            port_names,
+            current_op_ids,
             source_handle: owner,
             commit_sz,
             num_uncommitted_ops: 0,
@@ -177,17 +190,14 @@ impl SourceChannelManager {
     }
 
     fn commit(&mut self, request_termination: bool) -> Result<bool, ExecutionError> {
-        let epoch = self
-            .epoch_manager
-            .wait_for_epoch_close(request_termination, self.num_uncommitted_ops > 0);
+        let epoch = self.epoch_manager.wait_for_epoch_close(
+            (self.source_handle.clone(), self.current_op_ids.clone()),
+            request_termination,
+            self.num_uncommitted_ops > 0,
+        );
         if let Some(common_info) = epoch.common_info {
-            self.manager.send_commit(&Epoch::from(
-                common_info,
-                self.source_handle.clone(),
-                self.curr_txid,
-                self.curr_seq_in_tx,
-                epoch.decision_instant,
-            ))?;
+            self.manager
+                .send_commit(&Epoch::from(common_info, epoch.decision_instant))?;
         }
         self.num_uncommitted_ops = 0;
         self.last_commit_instant = epoch.decision_instant;
@@ -211,25 +221,32 @@ impl SourceChannelManager {
         port: PortHandle,
         request_termination: bool,
     ) -> Result<bool, ExecutionError> {
-        //
-        self.curr_txid = message.identifier.txid;
-        self.curr_seq_in_tx = message.identifier.seq_in_tx;
-        match message.kind {
-            IngestionMessageKind::OperationEvent { op, .. } => {
+        match message {
+            IngestionMessage::OperationEvent { op, id, .. } => {
+                let port_name = self.port_names[&port].clone();
+                self.current_op_ids.insert(
+                    port_name,
+                    if let Some(id) = id {
+                        TableState::Restartable(id)
+                    } else {
+                        TableState::NonRestartable
+                    },
+                );
+
                 self.manager.send_op(
-                    self.epoch_manager.record_store().create_operation(&op)?,
+                    ProcessorOperation::new(&op, self.epoch_manager.record_store().deref())?,
                     port,
                 )?;
                 self.num_uncommitted_ops += 1;
                 self.trigger_commit_if_needed(request_termination)
             }
-            IngestionMessageKind::SnapshottingDone => {
+            IngestionMessage::SnapshottingDone => {
                 self.num_uncommitted_ops += 1;
                 self.manager
                     .send_snapshotting_done(self.source_handle.id.clone())?;
                 self.commit(request_termination)
             }
-            IngestionMessageKind::SnapshottingStarted => {
+            IngestionMessage::SnapshottingStarted => {
                 // TODO "implement handle for snapshotting started"
                 Ok(false)
             }

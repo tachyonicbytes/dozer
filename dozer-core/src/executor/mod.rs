@@ -1,6 +1,7 @@
 use crate::builder_dag::{BuilderDag, NodeKind};
-use crate::checkpoint::CheckpointFactory;
+use crate::checkpoint::{CheckpointFactoryOptions, OptionCheckpoint};
 use crate::dag_schemas::DagSchemas;
+use crate::epoch::EpochManagerOptions;
 use crate::errors::ExecutionError;
 use crate::Dag;
 
@@ -22,6 +23,8 @@ pub struct ExecutorOptions {
     pub channel_buffer_sz: usize,
     pub commit_time_threshold: Duration,
     pub error_threshold: Option<u32>,
+    pub epoch_manager_options: EpochManagerOptions,
+    pub checkpoint_factory_options: CheckpointFactoryOptions,
 }
 
 impl Default for ExecutorOptions {
@@ -31,6 +34,8 @@ impl Default for ExecutorOptions {
             channel_buffer_sz: 20_000,
             commit_time_threshold: Duration::from_millis(50),
             error_threshold: Some(0),
+            epoch_manager_options: Default::default(),
+            checkpoint_factory_options: Default::default(),
         }
     }
 }
@@ -67,14 +72,19 @@ pub struct DagExecutorJoinHandle {
 }
 
 impl DagExecutor {
-    pub fn new(
+    pub async fn new(
         dag: Dag,
-        checkpoint_factory: Arc<CheckpointFactory>,
+        checkpoint: OptionCheckpoint,
         options: ExecutorOptions,
     ) -> Result<Self, ExecutionError> {
         let dag_schemas = DagSchemas::new(dag)?;
 
-        let builder_dag = BuilderDag::new(checkpoint_factory, dag_schemas)?;
+        let builder_dag = BuilderDag::new(
+            checkpoint,
+            options.checkpoint_factory_options.clone(),
+            dag_schemas,
+        )
+        .await?;
 
         Ok(Self {
             builder_dag,
@@ -93,11 +103,13 @@ impl DagExecutor {
         labels: LabelsAndProgress,
     ) -> Result<DagExecutorJoinHandle, ExecutionError> {
         // Construct execution dag.
+        let initial_epoch_id = self.builder_dag.initial_epoch_id();
         let mut execution_dag = ExecutionDag::new(
             self.builder_dag,
             labels,
             self.options.channel_buffer_sz,
             self.options.error_threshold,
+            self.options.epoch_manager_options.clone(),
         )?;
         let node_indexes = execution_dag.graph().node_identifiers().collect::<Vec<_>>();
 
@@ -108,7 +120,7 @@ impl DagExecutor {
                 .as_ref()
                 .expect("We created all nodes");
             match &node.kind {
-                NodeKind::Source(_, _) => {
+                NodeKind::Source { .. } => {
                     let (source_sender_node, source_listener_node) = create_source_nodes(
                         &mut execution_dag,
                         node_index,
@@ -120,11 +132,12 @@ impl DagExecutor {
                     join_handles.extend([sender, receiver]);
                 }
                 NodeKind::Processor(_) => {
-                    let processor_node = ProcessorNode::new(&mut execution_dag, node_index);
+                    let processor_node =
+                        ProcessorNode::new(&mut execution_dag, node_index, initial_epoch_id);
                     join_handles.push(start_processor(processor_node)?);
                 }
                 NodeKind::Sink(_) => {
-                    let sink_node = SinkNode::new(&mut execution_dag, node_index);
+                    let sink_node = SinkNode::new(&mut execution_dag, node_index, initial_epoch_id);
                     join_handles.push(start_sink(sink_node)?);
                 }
             }

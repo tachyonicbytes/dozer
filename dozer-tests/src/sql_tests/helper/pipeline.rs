@@ -2,22 +2,23 @@ use ahash::AHasher;
 use dozer_core::app::{App, AppPipeline};
 use dozer_core::appsource::{AppSourceManager, AppSourceMappings};
 use dozer_core::channels::SourceChannelForwarder;
-use dozer_core::checkpoint::{CheckpointFactory, CheckpointFactoryOptions};
+use dozer_core::checkpoint::OptionCheckpoint;
 use dozer_core::dozer_log::storage::Queue;
 use dozer_core::epoch::Epoch;
 use dozer_core::errors::ExecutionError;
 use dozer_core::executor_operation::ProcessorOperation;
 use dozer_core::node::{
     OutputPortDef, OutputPortType, PortHandle, Sink, SinkFactory, Source, SourceFactory,
+    SourceState,
 };
 
-use dozer_core::processor_record::ProcessorRecordStore;
 use dozer_core::{Dag, DEFAULT_PORT_HANDLE};
+use dozer_recordstore::{ProcessorRecordStore, StoreRecord};
 
-use dozer_core::executor::{DagExecutor, ExecutorOptions};
+use dozer_core::executor::DagExecutor;
 
-use dozer_sql::pipeline::builder::statement_to_pipeline;
-use dozer_types::crossbeam::channel::{Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender};
+use dozer_sql::builder::statement_to_pipeline;
 
 use dozer_types::errors::internal::BoxedError;
 use dozer_types::ingestion_types::IngestionMessage;
@@ -120,22 +121,22 @@ pub struct TestSource {
 }
 
 impl Source for TestSource {
-    fn can_start_from(&self, _last_checkpoint: (u64, u64)) -> Result<bool, BoxedError> {
-        Ok(false)
-    }
-
     fn start(
         &self,
         fw: &mut dyn SourceChannelForwarder,
-        _last_checkpoint: Option<(u64, u64)>,
+        _last_checkpoint: SourceState,
     ) -> Result<(), BoxedError> {
-        let mut idx = 0;
-
         while let Ok(Some((schema_name, op))) = self.receiver.recv() {
-            idx += 1;
             let port = self.name_to_port.get(&schema_name).expect("port not found");
-            fw.send(IngestionMessage::new_op(idx, 0, 0, op), *port)
-                .unwrap();
+            fw.send(
+                IngestionMessage::OperationEvent {
+                    table_index: 0,
+                    op,
+                    id: None,
+                },
+                *port,
+            )
+            .unwrap();
         }
         thread::sleep(Duration::from_millis(200));
 
@@ -292,8 +293,7 @@ impl TestPipeline {
                 .unwrap();
 
         let output_table = transform_response.output_tables_map.get("results").unwrap();
-        let (sender, receiver) =
-            dozer_types::crossbeam::channel::bounded::<Option<(String, Operation)>>(1000);
+        let (sender, receiver) = crossbeam::channel::bounded::<Option<(String, Operation)>>(1000);
 
         let mut port_to_schemas = HashMap::new();
         let mut mappings = HashMap::new();
@@ -346,7 +346,6 @@ impl TestPipeline {
     }
 
     pub async fn run(self) -> Result<Vec<Vec<String>>, ExecutionError> {
-        let record_store = Arc::new(ProcessorRecordStore::new()?);
         let temp_dir = TempDir::new("test")
             .map_err(|e| ExecutionError::FileSystemError("tempdir".into(), e))?;
         let checkpoint_dir = temp_dir
@@ -354,18 +353,8 @@ impl TestPipeline {
             .to_str()
             .expect("Path should always be utf8")
             .to_string();
-        let checkpoint_factory = CheckpointFactory::new(
-            record_store,
-            checkpoint_dir,
-            CheckpointFactoryOptions::default(),
-        )
-        .await?
-        .0;
-        let executor = DagExecutor::new(
-            self.dag,
-            Arc::new(checkpoint_factory),
-            ExecutorOptions::default(),
-        )?;
+        let checkpoint = OptionCheckpoint::new(checkpoint_dir, Default::default()).await?;
+        let executor = DagExecutor::new(self.dag, checkpoint, Default::default()).await?;
         let join_handle = executor.start(Arc::new(AtomicBool::new(true)), Default::default())?;
 
         for (schema_name, op) in &self.ops {
@@ -387,10 +376,7 @@ impl TestPipeline {
             for value in values {
                 let mut row = vec![];
                 for field in &value.values {
-                    let value = match field {
-                        dozer_types::types::Field::Null => "NULL".to_string(),
-                        _ => field.to_string().unwrap(),
-                    };
+                    let value = field.to_string();
                     row.push(value);
                 }
                 output.push(row);

@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 
-use dozer_cache::cache::expression::{default_limit_for_query, FilterExpression, QueryExpression};
+use dozer_cache::cache::expression::{FilterExpression, QueryExpression};
 use dozer_cache::cache::CacheRecord;
 use dozer_cache::CacheReader;
 use dozer_types::grpc_types::types::Operation;
 use dozer_types::log::warn;
 use dozer_types::serde_json;
+use dozer_types::tonic::{Code, Response, Status};
 use dozer_types::types::Schema;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Code, Response, Status};
 
 use crate::api_helper::{get_records, get_records_count};
 use crate::auth::Access;
@@ -52,10 +52,13 @@ pub fn query(
     query: Option<&str>,
     endpoint: &str,
     access: Option<Access>,
+    default_max_num_records: usize,
 ) -> Result<Vec<CacheRecord>, Status> {
-    let mut query = parse_query(query, QueryExpression::with_default_limit)?;
+    let mut query = parse_query(query, || {
+        QueryExpression::with_limit(default_max_num_records)
+    })?;
     if query.limit.is_none() {
-        query.limit = Some(default_limit_for_query());
+        query.limit = Some(default_max_num_records);
     }
     let records = get_records(reader, &mut query, endpoint, access)?;
     Ok(records)
@@ -95,6 +98,10 @@ pub fn on_event<T: Send + 'static>(
         return Err(Status::unavailable(
             "on_event is not enabled. This is currently an experimental feature. Enable it in the config.",
         ));
+    }
+
+    if endpoints.is_empty() {
+        return Err(Status::invalid_argument("empty endpoints array"));
     }
 
     let (tx, rx) = tokio::sync::mpsc::channel(1);

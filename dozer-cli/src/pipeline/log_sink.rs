@@ -8,14 +8,14 @@ use dozer_core::{
     epoch::Epoch,
     executor_operation::ProcessorOperation,
     node::{PortHandle, Sink, SinkFactory},
-    processor_record::ProcessorRecordStore,
     DEFAULT_PORT_HANDLE,
 };
+use dozer_recordstore::ProcessorRecordStore;
 use dozer_tracing::LabelsAndProgress;
+use dozer_types::errors::internal::BoxedError;
 use dozer_types::indicatif::ProgressBar;
 use dozer_types::types::Schema;
-use dozer_types::{errors::internal::BoxedError, parking_lot::Mutex};
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::Mutex};
 
 #[derive(Debug)]
 pub struct LogSinkFactory {
@@ -69,7 +69,6 @@ pub struct LogSink {
     runtime: Arc<Runtime>,
     log: Arc<Mutex<Log>>,
     pb: ProgressBar,
-    counter: u64,
 }
 
 impl LogSink {
@@ -80,17 +79,7 @@ impl LogSink {
         labels: LabelsAndProgress,
     ) -> Self {
         let pb = labels.create_progress_bar(endpoint_name);
-        Self {
-            runtime,
-            log,
-            pb,
-            counter: 0,
-        }
-    }
-
-    fn update_counter(&mut self) {
-        self.counter += 1;
-        self.pb.set_position(self.counter);
+        Self { runtime, log, pb }
     }
 }
 
@@ -101,37 +90,39 @@ impl Sink for LogSink {
         record_store: &ProcessorRecordStore,
         op: ProcessorOperation,
     ) -> Result<(), BoxedError> {
-        self.log
-            .lock()
-            .write(dozer_cache::dozer_log::replication::LogOperation::Op {
-                op: record_store
-                    .load_operation(&op)
-                    .map_err(Into::<BoxedError>::into)?,
-            });
-        self.update_counter();
+        let end = self.runtime.block_on(self.log.lock()).write(
+            dozer_cache::dozer_log::replication::LogOperation::Op {
+                op: op.load(record_store)?,
+            },
+        );
+        self.pb.set_position(end as u64);
         Ok(())
     }
 
     fn commit(&mut self, epoch_details: &Epoch) -> Result<(), BoxedError> {
-        self.log.lock().write(LogOperation::Commit {
-            decision_instant: epoch_details.decision_instant,
-        });
-        self.update_counter();
+        let end = self
+            .runtime
+            .block_on(self.log.lock())
+            .write(LogOperation::Commit {
+                decision_instant: epoch_details.decision_instant,
+            });
+        self.pb.set_position(end as u64);
         Ok(())
     }
 
     fn persist(&mut self, queue: &Queue) -> Result<(), BoxedError> {
-        self.log
-            .lock()
+        self.runtime
+            .block_on(self.log.lock())
             .persist(queue, self.log.clone(), &self.runtime)?;
         Ok(())
     }
 
     fn on_source_snapshotting_done(&mut self, connection_name: String) -> Result<(), BoxedError> {
-        self.log
-            .lock()
+        let end = self
+            .runtime
+            .block_on(self.log.lock())
             .write(LogOperation::SnapshottingDone { connection_name });
-        self.update_counter();
+        self.pb.set_position(end as u64);
         Ok(())
     }
 }

@@ -16,6 +16,12 @@ use futures_util::FutureExt;
 use std::{env, str::FromStr, sync::Arc, time::Duration};
 
 use crate::test_utils;
+use dozer_types::tonic::{
+    self,
+    metadata::MetadataValue,
+    transport::{Endpoint, Server},
+    Code, Request,
+};
 use tokio::{
     sync::{
         broadcast::{self, Receiver},
@@ -24,14 +30,9 @@ use tokio::{
     time::timeout,
 };
 use tokio_stream::StreamExt;
-use tonic::{
-    metadata::MetadataValue,
-    transport::{Endpoint, Server},
-    Code, Request,
-};
 
 pub async fn setup_pipeline() -> (Vec<Arc<CacheEndpoint>>, Receiver<Operation>) {
-    // Copy this file from dozer-tests output directory if it changes
+    // Copy this file from dozer-types compilation output directory if it changes
     let res = env::current_dir().unwrap();
     let descriptor_path = res.join("src/grpc/typed/tests/generated_films.bin");
     let descriptor_bytes = tokio::fs::read(&descriptor_path).await.unwrap();
@@ -78,7 +79,7 @@ pub async fn setup_pipeline() -> (Vec<Arc<CacheEndpoint>>, Receiver<Operation>) 
 async fn setup_typed_service(security: Option<ApiSecurity>) -> TypedService {
     let (endpoints, rx1) = setup_pipeline().await;
 
-    TypedService::new(endpoints, Some(rx1), security).unwrap()
+    TypedService::new(endpoints, Some(rx1), security, 50).unwrap()
 }
 
 async fn test_grpc_count_and_query_common(

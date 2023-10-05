@@ -1,22 +1,22 @@
 use crate::channels::{ProcessorChannelForwarder, SourceChannelForwarder};
-use crate::checkpoint::create_checkpoint_factory_for_test;
+use crate::checkpoint::create_checkpoint_for_test;
 use crate::epoch::Epoch;
-use crate::executor::{DagExecutor, ExecutorOptions};
+use crate::executor::DagExecutor;
 use crate::executor_operation::ProcessorOperation;
 use crate::node::{
     OutputPortDef, OutputPortType, PortHandle, Processor, ProcessorFactory, Sink, SinkFactory,
-    Source, SourceFactory,
+    Source, SourceFactory, SourceState,
 };
-use crate::processor_record::ProcessorRecordStore;
 use crate::tests::dag_base_run::NoopProcessorFactory;
 use crate::tests::sinks::{CountingSinkFactory, COUNTING_SINK_INPUT_PORT};
 use crate::tests::sources::{GeneratorSourceFactory, GENERATOR_SOURCE_OUTPUT_PORT};
 use crate::{Dag, Endpoint, DEFAULT_PORT_HANDLE};
-use dozer_log::storage::Queue;
+use dozer_log::storage::{Object, Queue};
 use dozer_log::tokio;
+use dozer_recordstore::{ProcessorRecordStore, ProcessorRecordStoreDeserializer};
 use dozer_types::errors::internal::BoxedError;
 use dozer_types::ingestion_types::IngestionMessage;
-use dozer_types::node::NodeHandle;
+use dozer_types::node::{NodeHandle, OpIdentifier};
 use dozer_types::types::{
     Field, FieldDefinition, FieldType, Operation, Record, Schema, SourceDefinition,
 };
@@ -63,7 +63,8 @@ impl ProcessorFactory for ErrorProcessorFactory {
         &self,
         _input_schemas: HashMap<PortHandle, Schema>,
         _output_schemas: HashMap<PortHandle, Schema>,
-        _record_store: &ProcessorRecordStore,
+        _record_store: &ProcessorRecordStoreDeserializer,
+        _checkpoint_data: Option<Vec<u8>>,
     ) -> Result<Box<dyn Processor>, BoxedError> {
         Ok(Box::new(ErrorProcessor {
             err_on: self.err_on,
@@ -108,6 +109,14 @@ impl Processor for ErrorProcessor {
         fw.send(op, DEFAULT_PORT_HANDLE);
         Ok(())
     }
+
+    fn serialize(
+        &mut self,
+        _record_store: &ProcessorRecordStore,
+        _object: Object,
+    ) -> Result<(), BoxedError> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -150,8 +159,9 @@ async fn test_run_dag_proc_err_panic() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()
@@ -209,8 +219,9 @@ async fn test_run_dag_proc_err_2() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()
@@ -269,8 +280,9 @@ async fn test_run_dag_proc_err_3() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()
@@ -345,14 +357,10 @@ pub(crate) struct ErrGeneratorSource {
 }
 
 impl Source for ErrGeneratorSource {
-    fn can_start_from(&self, _last_checkpoint: (u64, u64)) -> Result<bool, BoxedError> {
-        Ok(false)
-    }
-
     fn start(
         &self,
         fw: &mut dyn SourceChannelForwarder,
-        _checkpoint: Option<(u64, u64)>,
+        _checkpoint: SourceState,
     ) -> Result<(), BoxedError> {
         for n in 1..(self.count + 1) {
             if n == self.err_at {
@@ -360,17 +368,16 @@ impl Source for ErrGeneratorSource {
             }
 
             fw.send(
-                IngestionMessage::new_op(
-                    n,
-                    0,
-                    0,
-                    Operation::Insert {
+                IngestionMessage::OperationEvent {
+                    table_index: 0,
+                    op: Operation::Insert {
                         new: Record::new(vec![
                             Field::String(format!("key_{n}")),
                             Field::String(format!("value_{n}")),
                         ]),
                     },
-                ),
+                    id: Some(OpIdentifier::new(n, 0)),
+                },
                 GENERATOR_SOURCE_OUTPUT_PORT,
             )?;
         }
@@ -411,8 +418,9 @@ async fn test_run_dag_src_err() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap();
@@ -523,8 +531,9 @@ async fn test_run_dag_sink_err() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()
@@ -566,8 +575,9 @@ async fn test_run_dag_sink_err_panic() {
     )
     .unwrap();
 
-    let (_temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
-    DagExecutor::new(dag, checkpoint_factory, ExecutorOptions::default())
+    let (_temp_dir, checkpoint) = create_checkpoint_for_test().await;
+    DagExecutor::new(dag, checkpoint, Default::default())
+        .await
         .unwrap()
         .start(Arc::new(AtomicBool::new(true)), Default::default())
         .unwrap()

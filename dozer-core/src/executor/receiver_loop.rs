@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::time::SystemTime;
 
 use crossbeam::channel::{Receiver, Select};
 use dozer_types::log::debug;
@@ -16,6 +15,8 @@ use super::{name::Name, InputPortState};
 ///
 /// They both select from their input channels, and respond to "op", "commit", and terminate.
 pub trait ReceiverLoop: Name {
+    /// Returns the epoch id that this node was constructed for.
+    fn initial_epoch_id(&self) -> u64;
     /// Returns input channels to this node. Will be called exactly once in [`receiver_loop`].
     fn receivers(&mut self) -> Vec<Receiver<ExecutorOperation>>;
     /// Returns the name of the receiver at `index`. Used for logging.
@@ -30,7 +31,7 @@ pub trait ReceiverLoop: Name {
     fn on_snapshotting_done(&mut self, connection_name: String) -> Result<(), ExecutionError>;
 
     /// The loop implementation, calls [`on_op`], [`on_commit`] and [`on_terminate`] at appropriate times.
-    fn receiver_loop(&mut self) -> Result<(), ExecutionError> {
+    fn receiver_loop(&mut self, initial_epoch_id: u64) -> Result<(), ExecutionError> {
         let receivers = self.receivers();
         debug_assert!(
             !receivers.is_empty(),
@@ -39,7 +40,7 @@ pub trait ReceiverLoop: Name {
         let mut port_states = vec![InputPortState::Open; receivers.len()];
 
         let mut commits_received: usize = 0;
-        let mut common_epoch = Epoch::new(0, Default::default(), None, SystemTime::now());
+        let mut epoch_id = initial_epoch_id;
 
         let mut sel = init_select(&receivers);
         loop {
@@ -53,25 +54,13 @@ pub trait ReceiverLoop: Name {
                     self.on_op(index, op)?;
                 }
                 ExecutorOperation::Commit { epoch } => {
-                    assert_eq!(epoch.common_info.id, common_epoch.common_info.id);
+                    assert_eq!(epoch.common_info.id, epoch_id);
                     commits_received += 1;
                     sel.remove(index);
-                    // Commits from all inputs ports must have the same decision instant.
-                    if commits_received > 1 {
-                        assert_eq!(common_epoch.decision_instant, epoch.decision_instant);
-                    }
-                    common_epoch.common_info = epoch.common_info;
-                    common_epoch.decision_instant = epoch.decision_instant;
-                    common_epoch.details.extend(epoch.details);
 
                     if commits_received == receivers.len() {
-                        self.on_commit(&common_epoch)?;
-                        common_epoch = Epoch::new(
-                            common_epoch.common_info.id + 1,
-                            Default::default(),
-                            None,
-                            SystemTime::now(),
-                        );
+                        self.on_commit(&epoch)?;
+                        epoch_id += 1;
                         commits_received = 0;
                         sel = init_select(&receivers);
                     }
@@ -108,15 +97,15 @@ fn init_select(receivers: &Vec<Receiver<ExecutorOperation>>) -> Select {
 
 #[cfg(test)]
 mod tests {
-    use std::mem::swap;
+    use std::{mem::swap, sync::Arc, time::SystemTime};
 
     use crossbeam::channel::{unbounded, Sender};
     use dozer_types::{
-        node::{NodeHandle, OpIdentifier, SourceStates},
+        node::{NodeHandle, SourceStates},
         types::{Field, Record},
     };
 
-    use crate::processor_record::{ProcessorRecord, ProcessorRecordStore};
+    use dozer_recordstore::{ProcessorRecord, ProcessorRecordStore, StoreRecord};
 
     use super::*;
 
@@ -135,6 +124,10 @@ mod tests {
     }
 
     impl ReceiverLoop for TestReceiverLoop {
+        fn initial_epoch_id(&self) -> u64 {
+            0
+        }
+
         fn receivers(&mut self) -> Vec<Receiver<ExecutorOperation>> {
             let mut result = vec![];
             swap(&mut self.receivers, &mut result);
@@ -187,7 +180,7 @@ mod tests {
         let (mut test_loop, senders) = TestReceiverLoop::new(2);
         senders[0].send(ExecutorOperation::Terminate).unwrap();
         senders[1].send(ExecutorOperation::Terminate).unwrap();
-        test_loop.receiver_loop().unwrap();
+        test_loop.receiver_loop(0).unwrap();
         assert_eq!(test_loop.num_terminations, 1);
     }
 
@@ -202,14 +195,14 @@ mod tests {
             .unwrap();
         senders[0].send(ExecutorOperation::Terminate).unwrap();
         senders[1].send(ExecutorOperation::Terminate).unwrap();
-        test_loop.receiver_loop().unwrap();
+        test_loop.receiver_loop(0).unwrap();
         assert_eq!(test_loop.snapshotting_done, vec![connection_name])
     }
 
     #[test]
     fn receiver_loop_forwards_op() {
         let (mut test_loop, senders) = TestReceiverLoop::new(2);
-        let record_store = ProcessorRecordStore::new().unwrap();
+        let record_store = ProcessorRecordStore::new(Default::default()).unwrap();
         let record: ProcessorRecord = record_store
             .create_record(&Record::new(vec![Field::Int(1)]))
             .unwrap();
@@ -222,7 +215,7 @@ mod tests {
             .unwrap();
         senders[0].send(ExecutorOperation::Terminate).unwrap();
         senders[1].send(ExecutorOperation::Terminate).unwrap();
-        test_loop.receiver_loop().unwrap();
+        test_loop.receiver_loop(0).unwrap();
         assert_eq!(
             test_loop.ops,
             vec![(0, ProcessorOperation::Insert { new: record })]
@@ -230,21 +223,15 @@ mod tests {
     }
 
     #[test]
-    fn receiver_loop_merges_commit_epoch_and_increases_epoch_id() {
+    fn receiver_loop_increases_epoch_id() {
         let (mut test_loop, senders) = TestReceiverLoop::new(2);
-        let mut details = SourceStates::default();
-        details.insert(
-            NodeHandle::new(None, "0".to_string()),
-            OpIdentifier::new(0, 0),
-        );
+        let mut source_states = SourceStates::default();
+        source_states.insert(NodeHandle::new(None, "0".to_string()), Default::default());
+        source_states.insert(NodeHandle::new(None, "1".to_string()), Default::default());
+        let source_states = Arc::new(source_states);
         let decision_instant = SystemTime::now();
-        let mut epoch0 = Epoch::new(0, details, None, decision_instant);
-        let mut details = SourceStates::default();
-        details.insert(
-            NodeHandle::new(None, "1".to_string()),
-            OpIdentifier::new(0, 0),
-        );
-        let mut epoch1 = Epoch::new(0, details, None, decision_instant);
+        let mut epoch0 = Epoch::new(0, source_states.clone(), None, decision_instant);
+        let mut epoch1 = Epoch::new(0, source_states, None, decision_instant);
         senders[0]
             .send(ExecutorOperation::Commit {
                 epoch: epoch0.clone(),
@@ -269,16 +256,11 @@ mod tests {
             .unwrap();
         senders[0].send(ExecutorOperation::Terminate).unwrap();
         senders[1].send(ExecutorOperation::Terminate).unwrap();
-        test_loop.receiver_loop().unwrap();
+        test_loop.receiver_loop(0).unwrap();
 
-        let mut details = SourceStates::new();
-        details.extend(epoch0.details);
-        details.extend(epoch1.details);
         assert_eq!(test_loop.commits[0].common_info.id, 0);
-        assert_eq!(test_loop.commits[0].details, details);
         assert_eq!(test_loop.commits[0].decision_instant, decision_instant);
         assert_eq!(test_loop.commits[1].common_info.id, 1);
-        assert_eq!(test_loop.commits[1].details, details);
         assert_eq!(test_loop.commits[1].decision_instant, decision_instant);
     }
 
@@ -286,19 +268,13 @@ mod tests {
     #[should_panic]
     fn receiver_loop_panics_on_inconsistent_commit_epoch() {
         let (mut test_loop, senders) = TestReceiverLoop::new(2);
-        let mut details = SourceStates::new();
-        details.insert(
-            NodeHandle::new(None, "0".to_string()),
-            OpIdentifier::new(0, 0),
-        );
+        let mut source_states = SourceStates::new();
+        source_states.insert(NodeHandle::new(None, "0".to_string()), Default::default());
+        source_states.insert(NodeHandle::new(None, "1".to_string()), Default::default());
+        let source_states = Arc::new(source_states);
         let decision_instant = SystemTime::now();
-        let epoch0 = Epoch::new(0, details, None, decision_instant);
-        let mut details = SourceStates::new();
-        details.insert(
-            NodeHandle::new(None, "1".to_string()),
-            OpIdentifier::new(0, 0),
-        );
-        let epoch1 = Epoch::new(1, details, None, decision_instant);
+        let epoch0 = Epoch::new(0, source_states.clone(), None, decision_instant);
+        let epoch1 = Epoch::new(1, source_states, None, decision_instant);
         senders[0]
             .send(ExecutorOperation::Commit { epoch: epoch0 })
             .unwrap();
@@ -307,6 +283,6 @@ mod tests {
             .unwrap();
         senders[0].send(ExecutorOperation::Terminate).unwrap();
         senders[1].send(ExecutorOperation::Terminate).unwrap();
-        test_loop.receiver_loop().unwrap();
+        test_loop.receiver_loop(0).unwrap();
     }
 }

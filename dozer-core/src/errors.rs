@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use crate::node::PortHandle;
-use dozer_storage::errors::StorageError;
+use dozer_recordstore::RecordStoreError;
 use dozer_types::errors::internal::BoxedError;
 use dozer_types::node::NodeHandle;
-use dozer_types::thiserror;
 use dozer_types::thiserror::Error;
+use dozer_types::{bincode, thiserror};
 
 #[derive(Error, Debug)]
 pub enum ExecutionError {
@@ -35,12 +35,23 @@ pub enum ExecutionError {
     Source(#[source] BoxedError),
     #[error("File system error {0:?}: {1}")]
     FileSystemError(PathBuf, #[source] std::io::Error),
-    #[error("Storage error: {0}")]
-    Storage(#[from] StorageError),
+    #[error("Recordstore error: {0}")]
+    RecordStore(#[from] RecordStoreError),
     #[error("Object storage error: {0}")]
     ObjectStorage(#[from] dozer_log::storage::Error),
     #[error("Checkpoint writer thread panicked")]
     CheckpointWriterThreadPanicked,
+    #[error("Unrecognized checkpoint: {0}")]
+    UnrecognizedCheckpoint(String),
+    #[error("Cannot deserialize checkpoint: {0}")]
+    CorruptedCheckpoint(#[source] bincode::Error),
+    #[error("Table {table_name} of source {source_name} cannot restart. You have to clean data from previous runs by running `dozer clean`")]
+    SourceCannotRestart {
+        source_name: NodeHandle,
+        table_name: String,
+    },
+    #[error("Failed to create checkpoint: {0}")]
+    FailedToCreateCheckpoint(BoxedError),
 }
 
 impl<T> From<crossbeam::channel::SendError<T>> for ExecutionError {

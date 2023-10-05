@@ -64,6 +64,8 @@ pub trait Storage: Debug + DynClone + Send + Sync + 'static {
         key: String,
     ) -> Result<BoxStream<Result<Bytes, std::io::Error>>, Error>;
 
+    async fn delete_objects(&self, keys: Vec<String>) -> Result<(), Error>;
+
     async fn download_object(&self, key: String) -> Result<Vec<u8>, Error> {
         let mut stream = self.get_object(key).await?;
         let mut data = vec![];
@@ -81,23 +83,23 @@ mod s3;
 pub enum Error {
     #[error("create bucket: {0:?}")]
     CreateBucket(#[from] SdkError<CreateBucketError>),
-    #[error("delete objects: {0}")]
+    #[error("delete objects: {0:?}")]
     DeleteObjects(#[from] SdkError<DeleteObjectsError>),
-    #[error("delete bucket: {0}")]
+    #[error("delete bucket: {0:?}")]
     DeleteBucket(#[from] SdkError<DeleteBucketError>),
-    #[error("put object: {0}")]
+    #[error("put object: {0:?}")]
     PutObject(#[from] SdkError<PutObjectError>),
-    #[error("create multipart upload: {0}")]
+    #[error("create multipart upload: {0:?}")]
     CreateMultipartUpload(#[from] SdkError<CreateMultipartUploadError>),
-    #[error("upload part: {0}")]
+    #[error("upload part: {0:?}")]
     UploadPart(#[from] SdkError<UploadPartError>),
-    #[error("complete multipart upload: {0}")]
+    #[error("complete multipart upload: {0:?}")]
     CompleteMultipartUpload(#[from] SdkError<CompleteMultipartUploadError>),
-    #[error("list objects v2: {0}")]
+    #[error("list objects v2: {0:?}")]
     ListObjectsV2(#[from] SdkError<ListObjectsV2Error>),
     #[error("conversion: {0}")]
     Conversion(#[from] ConversionError),
-    #[error("get object: {0}")]
+    #[error("get object: {0:?}")]
     GetObject(#[from] SdkError<GetObjectError>),
     #[error("stream object: {0}")]
     StreamObject(#[source] std::io::Error),
@@ -109,6 +111,8 @@ pub enum Error {
     NonUtf8Path(PathBuf),
     #[error("upload not found: key {key}, upload id {upload_id}")]
     UploadNotFound { key: String, upload_id: String },
+    #[error("empty delete objects request")]
+    EmptyDeleteObjectsRequest,
 }
 
 use dyn_clone::DynClone;

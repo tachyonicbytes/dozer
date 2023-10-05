@@ -13,7 +13,7 @@ use crate::helper::{self, events_schema, spans_schema};
 use dozer_types::arrow_types::from_arrow::serialize_record_batch;
 use dozer_types::arrow_types::to_arrow::map_record_to_arrow;
 use dozer_types::grpc_types::ingest::IngestArrowRequest;
-use dozer_types::models::telemetry::DozerTelemetryConfig;
+use dozer_types::models::telemetry::{default_ingest_address, DozerTelemetryConfig};
 use dozer_types::tonic;
 use opentelemetry::sdk::export::trace::SpanData;
 use std::sync::atomic::Ordering;
@@ -38,11 +38,13 @@ impl SpanExporter for DozerExporter {
     fn export(
         &mut self,
         batch: Vec<SpanData>,
-    ) -> dozer_types::tonic::codegen::futures_core::future::BoxFuture<
-        'static,
-        opentelemetry::sdk::export::trace::ExportResult,
-    > {
-        let endpoint = self.config.endpoint.clone();
+    ) -> futures_util::future::BoxFuture<'static, opentelemetry::sdk::export::trace::ExportResult>
+    {
+        let endpoint = self
+            .config
+            .endpoint
+            .clone()
+            .unwrap_or_else(default_ingest_address);
         let seq_no = self.seq_no.clone();
         Box::pin(async move {
             let res = ingest_span(batch, endpoint, seq_no).await;

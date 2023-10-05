@@ -1,11 +1,13 @@
+use dozer_recordstore::ProcessorRecordStore;
+use dozer_types::node::{NodeHandle, SourceStates, TableState};
 use dozer_types::parking_lot::Mutex;
+use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::sync::{Arc, Barrier};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
 use crate::checkpoint::{CheckpointFactory, CheckpointWriter};
-use crate::processor_record::ProcessorRecordStore;
 
 use super::EpochCommonInfo;
 
@@ -27,6 +29,8 @@ enum EpochManagerStateKind {
         should_terminate: bool,
         /// Whether we should tell the sources to commit when this epoch closes.
         should_commit: bool,
+        /// The collected source states.
+        source_states: SourceStates,
         /// Sources wait on this barrier to synchronize an epoch close.
         barrier: Arc<Barrier>,
     },
@@ -37,6 +41,8 @@ enum EpochManagerStateKind {
         action: Action,
         /// Closed epoch id.
         epoch_id: u64,
+        /// Collected source states.
+        source_states: Arc<SourceStates>,
         /// Instant when the epoch was closed.
         instant: SystemTime,
         /// Number of sources that have confirmed the epoch close.
@@ -67,12 +73,13 @@ impl EpochManagerStateKind {
             epoch_id,
             should_terminate: true,
             should_commit: false,
+            source_states: Default::default(),
             barrier: Arc::new(Barrier::new(num_sources)),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EpochManagerOptions {
     pub max_num_records_before_persist: usize,
     pub max_interval_before_persist_in_seconds: u64,
@@ -107,17 +114,19 @@ pub struct ClosedEpoch {
 impl EpochManager {
     pub fn new(
         num_sources: usize,
+        epoch_id: u64,
         checkpoint_factory: Arc<CheckpointFactory>,
         options: EpochManagerOptions,
     ) -> Self {
         debug_assert!(num_sources > 0);
+        let next_record_index_to_persist = checkpoint_factory.record_store().num_records();
         Self {
             num_sources,
             checkpoint_factory,
             options,
             state: Mutex::new(EpochManagerState {
-                kind: EpochManagerStateKind::new_closing(0, num_sources),
-                next_record_index_to_persist: 0,
+                kind: EpochManagerStateKind::new_closing(epoch_id, num_sources),
+                next_record_index_to_persist,
                 last_persisted_epoch_decision_instant: SystemTime::now(),
             }),
         }
@@ -137,6 +146,7 @@ impl EpochManager {
     /// - `request_commit`: Whether the source wants to commit. The `EpochManager` checks if any source wants to commit and returns `Some` if so.
     pub fn wait_for_epoch_close(
         &self,
+        source_state: (NodeHandle, HashMap<String, TableState>),
         request_termination: bool,
         request_commit: bool,
     ) -> ClosedEpoch {
@@ -146,6 +156,7 @@ impl EpochManager {
                 EpochManagerStateKind::Closing {
                     should_terminate,
                     should_commit,
+                    source_states,
                     barrier,
                     ..
                 } => {
@@ -153,6 +164,8 @@ impl EpochManager {
                     *should_terminate = *should_terminate && request_termination;
                     // If anyone wants to commit, we commit.
                     *should_commit = *should_commit || request_commit;
+                    // Collect source states.
+                    source_states.insert(source_state.0, source_state.1);
                     break barrier.clone();
                 }
                 EpochManagerStateKind::Closed { .. } => {
@@ -172,6 +185,7 @@ impl EpochManager {
             epoch_id,
             should_terminate,
             should_commit,
+            source_states,
             ..
         } = &mut state.kind
         {
@@ -199,6 +213,7 @@ impl EpochManager {
                 terminating: *should_terminate,
                 action,
                 epoch_id: *epoch_id,
+                source_states: Arc::new(std::mem::take(source_states)),
                 instant,
                 num_source_confirmations: 0,
             };
@@ -209,6 +224,7 @@ impl EpochManager {
                 terminating,
                 action,
                 epoch_id,
+                source_states,
                 instant,
                 num_source_confirmations,
             } => {
@@ -217,11 +233,13 @@ impl EpochManager {
                         Arc::new(CheckpointWriter::new(
                             self.checkpoint_factory.clone(),
                             *epoch_id,
+                            source_states.clone(),
                         ))
                     });
                     EpochCommonInfo {
                         id: *epoch_id,
                         checkpoint_writer,
+                        source_states: source_states.clone(),
                     }
                 });
 
@@ -255,9 +273,10 @@ impl EpochManager {
 
 #[cfg(test)]
 mod tests {
-    use std::thread::scope;
+    use std::{collections::HashMap, ops::Deref, thread::scope};
 
     use dozer_log::tokio;
+    use dozer_recordstore::StoreRecord;
     use tempdir::TempDir;
 
     use crate::checkpoint::create_checkpoint_factory_for_test;
@@ -272,7 +291,7 @@ mod tests {
     ) -> (TempDir, EpochManager) {
         let (temp_dir, checkpoint_factory, _) = create_checkpoint_factory_for_test(&[]).await;
 
-        let epoch_manager = EpochManager::new(num_sources, checkpoint_factory, options);
+        let epoch_manager = EpochManager::new(num_sources, 0, checkpoint_factory, options);
 
         (temp_dir, epoch_manager)
     }
@@ -281,13 +300,17 @@ mod tests {
         epoch_manager: &EpochManager,
         termination_gen: &(impl Fn(u16) -> bool + Sync),
         commit_gen: &(impl Fn(u16) -> bool + Sync),
+        source_state_gen: &(impl Fn(u16) -> (NodeHandle, HashMap<String, TableState>) + Sync),
     ) -> ClosedEpoch {
         scope(|scope| {
             let handles = (0..NUM_THREADS)
                 .map(|index| {
                     scope.spawn(move || {
-                        epoch_manager
-                            .wait_for_epoch_close(termination_gen(index), commit_gen(index))
+                        epoch_manager.wait_for_epoch_close(
+                            source_state_gen(index),
+                            termination_gen(index),
+                            commit_gen(index),
+                        )
                     })
                 })
                 .collect::<Vec<_>>();
@@ -309,31 +332,63 @@ mod tests {
         })
     }
 
+    fn generate_source_state(index: u16) -> (NodeHandle, HashMap<String, TableState>) {
+        (
+            NodeHandle::new(Some(index), index.to_string()),
+            Default::default(),
+        )
+    }
+
     #[tokio::test]
     async fn test_epoch_manager() {
         let (_temp_dir, epoch_manager) =
             create_epoch_manager(NUM_THREADS as usize, Default::default()).await;
 
         // All sources have no new data, epoch should not be closed.
-        let ClosedEpoch { common_info, .. } =
-            run_epoch_manager(&epoch_manager, &|_| false, &|_| false);
+        let ClosedEpoch { common_info, .. } = run_epoch_manager(
+            &epoch_manager,
+            &|_| false,
+            &|_| false,
+            &generate_source_state,
+        );
         assert!(common_info.is_none());
 
         // One source has new data, epoch should be closed.
-        let ClosedEpoch { common_info, .. } =
-            run_epoch_manager(&epoch_manager, &|_| false, &|index| index == 0);
-        assert_eq!(common_info.unwrap().id, 0);
+        let ClosedEpoch { common_info, .. } = run_epoch_manager(
+            &epoch_manager,
+            &|_| false,
+            &|index| index == 0,
+            &generate_source_state,
+        );
+        let common_info = common_info.unwrap();
+        assert_eq!(common_info.id, 0);
+        assert_eq!(
+            common_info.source_states.deref(),
+            &(0..NUM_THREADS)
+                .map(generate_source_state)
+                .collect::<HashMap<_, _>>()
+        );
 
         // All but one source requests termination, should not terminate.
         let ClosedEpoch {
             should_terminate, ..
-        } = run_epoch_manager(&epoch_manager, &|index| index != 0, &|_| false);
+        } = run_epoch_manager(
+            &epoch_manager,
+            &|index| index != 0,
+            &|_| false,
+            &generate_source_state,
+        );
         assert!(!should_terminate);
 
         // All sources requests termination, should terminate.
         let ClosedEpoch {
             should_terminate, ..
-        } = run_epoch_manager(&epoch_manager, &|_| true, &|_| false);
+        } = run_epoch_manager(
+            &epoch_manager,
+            &|_| true,
+            &|_| false,
+            &generate_source_state,
+        );
         assert!(should_terminate);
     }
 
@@ -349,19 +404,20 @@ mod tests {
         .await;
 
         // Epoch manager must be used from non-tokio threads.
+        let source_state = generate_source_state(0);
         std::thread::spawn(move || {
             // No record, no persist.
-            let epoch = epoch_manager.wait_for_epoch_close(false, true);
+            let epoch = epoch_manager.wait_for_epoch_close(source_state.clone(), false, true);
             assert!(epoch.common_info.unwrap().checkpoint_writer.is_none());
 
             // One record, persist.
             epoch_manager.record_store().create_ref(&[]).unwrap();
-            let epoch = epoch_manager.wait_for_epoch_close(false, true);
+            let epoch = epoch_manager.wait_for_epoch_close(source_state.clone(), false, true);
             assert!(epoch.common_info.unwrap().checkpoint_writer.is_some());
 
             // Time passes, persist.
             std::thread::sleep(Duration::from_secs(1));
-            let epoch = epoch_manager.wait_for_epoch_close(false, true);
+            let epoch = epoch_manager.wait_for_epoch_close(source_state.clone(), false, true);
             assert!(epoch.common_info.unwrap().checkpoint_writer.is_some());
         })
         .join()

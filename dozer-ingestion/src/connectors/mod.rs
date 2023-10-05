@@ -24,10 +24,12 @@ use crate::connectors::postgres::connector::{PostgresConfig, PostgresConnector};
 use crate::errors::ConnectorError;
 use crate::ingestion::Ingestor;
 
+use dozer_types::ingestion_types::default_grpc_adapter;
 use dozer_types::log::debug;
 use dozer_types::models::connection::Connection;
 use dozer_types::models::connection::ConnectionConfig;
-use tonic::async_trait;
+use dozer_types::node::OpIdentifier;
+use dozer_types::tonic::async_trait;
 
 use crate::connectors::object_store::connector::ObjectStoreConnector;
 
@@ -47,8 +49,8 @@ use self::ethereum::{EthLogConnector, EthTraceConnector};
 use self::grpc::connector::GrpcConnector;
 use self::grpc::{ArrowAdapter, DefaultAdapter};
 use self::mysql::connector::{mysql_connection_opts_from_url, MySQLConnector};
+#[cfg(feature = "snowflake")]
 use crate::connectors::snowflake::connector::SnowflakeConnector;
-use crate::errors::ConnectorError::{MissingConfiguration, WrongConnectionConfiguration};
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq, Default)]
 #[serde(crate = "dozer_types::serde")]
@@ -135,7 +137,7 @@ pub trait Connector: Send + Sync + Debug {
     async fn start(
         &self,
         ingestor: &Ingestor,
-        tables: Vec<TableInfo>,
+        tables: Vec<TableToIngest>,
     ) -> Result<(), ConnectorError>;
 }
 
@@ -172,10 +174,32 @@ pub struct TableInfo {
     pub column_names: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+/// `TableInfo` with an optional checkpoint info.
+pub struct TableToIngest {
+    /// The `schema` scope of the table.
+    pub schema: Option<String>,
+    /// The table name, must be unique under the `schema` scope, or global scope if `schema` is `None`.
+    pub name: String,
+    /// The column names to be mapped.
+    pub column_names: Vec<String>,
+    /// The checkpoint to start after.
+    pub checkpoint: Option<OpIdentifier>,
+}
+
+impl TableToIngest {
+    pub fn from_scratch(table_info: TableInfo) -> Self {
+        Self {
+            schema: table_info.schema,
+            name: table_info.name,
+            column_names: table_info.column_names,
+            checkpoint: None,
+        }
+    }
+}
+
 pub fn get_connector(connection: Connection) -> Result<Box<dyn Connector>, ConnectorError> {
-    let config = connection
-        .config
-        .ok_or_else(|| ConnectorError::MissingConfiguration(connection.name.clone()))?;
+    let config = connection.config;
     match config {
         ConnectionConfig::Postgres(_) => {
             let config = map_connection_config(&config)?;
@@ -200,20 +224,28 @@ pub fn get_connector(connection: Connection) -> Result<Box<dyn Connector>, Conne
         },
         #[cfg(not(feature = "ethereum"))]
         ConnectionConfig::Ethereum(_) => Err(ConnectorError::EthereumFeatureNotEnabled),
-        ConnectionConfig::Grpc(grpc_config) => match grpc_config.adapter.as_str() {
-            "arrow" => Ok(Box::new(GrpcConnector::<ArrowAdapter>::new(
-                connection.name,
-                grpc_config,
-            )?)),
-            "default" => Ok(Box::new(GrpcConnector::<DefaultAdapter>::new(
-                connection.name,
-                grpc_config,
-            )?)),
-            _ => Err(ConnectorError::UnsupportedGrpcAdapter(
-                connection.name,
-                grpc_config.adapter,
-            )),
-        },
+        ConnectionConfig::Grpc(grpc_config) => {
+            match grpc_config
+                .adapter
+                .clone()
+                .unwrap_or_else(default_grpc_adapter)
+                .as_str()
+            {
+                "arrow" => Ok(Box::new(GrpcConnector::<ArrowAdapter>::new(
+                    connection.name,
+                    grpc_config,
+                )?)),
+                "default" => Ok(Box::new(GrpcConnector::<DefaultAdapter>::new(
+                    connection.name,
+                    grpc_config,
+                )?)),
+                _ => Err(ConnectorError::UnsupportedGrpcAdapter(
+                    connection.name,
+                    grpc_config.adapter,
+                )),
+            }
+        }
+        #[cfg(feature = "snowflake")]
         ConnectionConfig::Snowflake(snowflake) => {
             let snowflake_config = snowflake;
 
@@ -222,6 +254,8 @@ pub fn get_connector(connection: Connection) -> Result<Box<dyn Connector>, Conne
                 snowflake_config,
             )))
         }
+        #[cfg(not(feature = "snowflake"))]
+        ConnectionConfig::Snowflake(_) => Err(ConnectorError::SnowflakeFeatureNotEnabled),
         #[cfg(feature = "kafka")]
         ConnectionConfig::Kafka(kafka_config) => Ok(Box::new(KafkaConnector::new(kafka_config))),
         #[cfg(not(feature = "kafka"))]
@@ -256,18 +290,18 @@ pub fn get_connector(connection: Connection) -> Result<Box<dyn Connector>, Conne
     }
 }
 
-pub fn get_connector_info_table(connection: &Connection) -> Result<Table, ConnectorError> {
+pub fn get_connector_info_table(connection: &Connection) -> Option<Table> {
     match &connection.config {
-        Some(ConnectionConfig::Postgres(config)) => match config.replenish() {
-            Ok(conf) => Ok(conf.convert_to_table()),
-            Err(e) => Err(WrongConnectionConfiguration(e)),
+        ConnectionConfig::Postgres(config) => match config.replenish() {
+            Ok(conf) => Some(conf.convert_to_table()),
+            Err(_) => None,
         },
-        Some(ConnectionConfig::Ethereum(config)) => Ok(config.convert_to_table()),
-        Some(ConnectionConfig::Snowflake(config)) => Ok(config.convert_to_table()),
-        Some(ConnectionConfig::Kafka(config)) => Ok(config.convert_to_table()),
-        Some(ConnectionConfig::S3Storage(config)) => Ok(config.convert_to_table()),
-        Some(ConnectionConfig::LocalStorage(config)) => Ok(config.convert_to_table()),
-        _ => Err(MissingConfiguration(connection.name.clone())),
+        ConnectionConfig::Ethereum(config) => Some(config.convert_to_table()),
+        ConnectionConfig::Snowflake(config) => Some(config.convert_to_table()),
+        ConnectionConfig::Kafka(config) => Some(config.convert_to_table()),
+        ConnectionConfig::S3Storage(config) => Some(config.convert_to_table()),
+        ConnectionConfig::LocalStorage(config) => Some(config.convert_to_table()),
+        _ => None,
     }
 }
 

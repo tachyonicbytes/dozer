@@ -3,18 +3,16 @@ use std::path::Path;
 
 use super::adapter::{GrpcIngestor, IngestAdapter};
 use super::ingest::IngestorServiceImpl;
-use crate::connectors::{table_name, SourceSchema, SourceSchemaResult, TableIdentifier};
-use crate::{
-    connectors::{Connector, TableInfo},
-    errors::ConnectorError,
-    ingestion::Ingestor,
+use crate::connectors::{
+    table_name, Connector, SourceSchema, SourceSchemaResult, TableIdentifier, TableToIngest,
 };
+use crate::{connectors::TableInfo, errors::ConnectorError, ingestion::Ingestor};
 use dozer_types::grpc_types::ingest::ingest_service_server::IngestServiceServer;
-use dozer_types::ingestion_types::GrpcConfig;
+use dozer_types::ingestion_types::{default_ingest_host, default_ingest_port, GrpcConfig};
 use dozer_types::log::{info, warn};
+use dozer_types::tonic::async_trait;
+use dozer_types::tonic::transport::Server;
 use dozer_types::tracing::Level;
-use tonic::async_trait;
-use tonic::transport::Server;
 use tower_http::trace::{self, TraceLayer};
 
 #[derive(Debug)]
@@ -43,14 +41,7 @@ where
     where
         T: IngestAdapter,
     {
-        let schemas = config.schemas.as_ref().map_or_else(
-            || {
-                Err(ConnectorError::InitializationError(
-                    "schemas not found".to_string(),
-                ))
-            },
-            Ok,
-        )?;
+        let schemas = &config.schemas;
         let schemas_str = match schemas {
             dozer_types::ingestion_types::GrpcConfigSchemas::Inline(schemas_str) => {
                 schemas_str.clone()
@@ -68,12 +59,12 @@ where
     pub async fn serve(
         &self,
         ingestor: &Ingestor,
-        tables: Vec<TableInfo>,
+        tables: Vec<TableToIngest>,
     ) -> Result<(), ConnectorError> {
-        let host = &self.config.host;
-        let port = self.config.port;
+        let host = self.config.host.clone().unwrap_or_else(default_ingest_host);
+        let port = self.config.port.unwrap_or_else(default_ingest_port);
 
-        let addr = format!("{host:}:{port:}").parse().map_err(|e| {
+        let addr = format!("{host}:{port}").parse().map_err(|e| {
             ConnectorError::InitializationError(format!("Failed to parse address: {e}"))
         })?;
 
@@ -85,9 +76,7 @@ where
         let ingestor = unsafe { std::mem::transmute::<&'_ Ingestor, &'static Ingestor>(ingestor) };
 
         let ingest_service = IngestorServiceImpl::new(adapter, ingestor, tables);
-        let ingest_service = tonic_web::config()
-            .allow_all_origins()
-            .enable(IngestServiceServer::new(ingest_service));
+        let ingest_service = tonic_web::enable(IngestServiceServer::new(ingest_service));
 
         let reflection_service = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(
@@ -222,7 +211,7 @@ where
     async fn start(
         &self,
         ingestor: &Ingestor,
-        tables: Vec<TableInfo>,
+        tables: Vec<TableToIngest>,
     ) -> Result<(), ConnectorError> {
         self.serve(ingestor, tables).await
     }

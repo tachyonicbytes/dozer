@@ -1,34 +1,29 @@
 use clap::Parser;
+use dozer_api::shutdown;
 #[cfg(feature = "cloud")]
 use dozer_cli::cli::cloud::CloudCommands;
-use dozer_cli::cli::generate_config_repl;
 use dozer_cli::cli::types::{Cli, Commands, ConnectorCommand, RunCommands, SecurityCommands};
+use dozer_cli::cli::{generate_config_repl, init_config};
 use dozer_cli::cli::{init_dozer, list_sources, LOGO};
-use dozer_cli::errors::{CliError, CloudError, OrchestrationError};
-use dozer_cli::simple::SimpleOrchestrator;
 #[cfg(feature = "cloud")]
-use dozer_cli::CloudOrchestrator;
-use dozer_cli::{live, set_ctrl_handler, set_panic_hook, shutdown};
+use dozer_cli::cloud::{cloud_app_context::CloudAppContext, CloudClient, DozerGrpcCloudClient};
+use dozer_cli::errors::{CliError, CloudError, OrchestrationError};
+use dozer_cli::{live, set_ctrl_handler, set_panic_hook};
 use dozer_tracing::LabelsAndProgress;
+use dozer_types::models::config::Config;
 use dozer_types::models::telemetry::{TelemetryConfig, TelemetryMetricsConfig};
 use dozer_types::serde::Deserialize;
-use dozer_types::tracing::{error, info};
-use tokio::runtime::Runtime;
-use tokio::time;
-
-use clap::CommandFactory;
-#[cfg(feature = "cloud")]
-use dozer_cli::cloud_app_context::CloudAppContext;
+use dozer_types::tracing::{error, error_span, info};
 use std::cmp::Ordering;
 use std::sync::Arc;
+use tokio::runtime::Runtime;
+use tokio::time;
 
 use dozer_types::log::{debug, warn};
 use std::time::Duration;
 use std::{env, process};
 
 fn main() {
-    set_panic_hook();
-
     if let Err(e) = run() {
         display_error(&e);
         process::exit(1);
@@ -128,34 +123,101 @@ fn run() -> Result<(), OrchestrationError> {
     // and then initializing it after reading the configuration. This is a hacky workaround, but it works.
 
     let cli = parse_and_generate()?;
-    let mut dozer = init_orchestrator(&cli)?;
-    let (shutdown_sender, shutdown_receiver) = shutdown::new(&dozer.runtime);
+
+    let runtime = Arc::new(Runtime::new().map_err(CliError::FailedToCreateTokioRuntime)?);
+
+    let (shutdown_sender, shutdown_receiver) = shutdown::new(&runtime);
     set_ctrl_handler(shutdown_sender);
 
+    set_panic_hook();
+
+    // Run Cloud
+    #[cfg(feature = "cloud")]
+    if let Commands::Cloud(cloud) = &cli.cmd {
+        render_logo();
+        let cloud = cloud.clone();
+        let res = if let CloudCommands::Login {
+            organisation_slug,
+            profile_name,
+            client_id,
+            client_secret,
+        } = cloud.command.clone()
+        {
+            CloudClient::login(
+                runtime.clone(),
+                cloud,
+                organisation_slug,
+                profile_name,
+                client_id,
+                client_secret,
+            )
+        } else {
+            let config = init_configuration(&cli, runtime.clone())?;
+            let mut cloud_client = CloudClient::new(config.clone(), runtime.clone());
+            match cloud.command.clone() {
+                CloudCommands::Deploy(deploy) => {
+                    cloud_client.deploy(cloud, deploy, cli.config_paths.clone())
+                }
+                CloudCommands::Login {
+                    organisation_slug: _,
+                    profile_name: _,
+                    client_id: _,
+                    client_secret: _,
+                } => unreachable!("This is handled earlier"),
+                CloudCommands::Secrets(command) => {
+                    cloud_client.execute_secrets_command(cloud, command)
+                }
+                CloudCommands::Delete => cloud_client.delete(cloud),
+                CloudCommands::Status => cloud_client.status(cloud),
+                CloudCommands::Monitor => cloud_client.monitor(cloud),
+                CloudCommands::Logs(logs) => cloud_client.trace_logs(cloud, logs),
+                CloudCommands::Version(version) => cloud_client.version(cloud, version),
+                CloudCommands::List(list) => cloud_client.list(cloud, list),
+                CloudCommands::SetApp { app_id } => {
+                    CloudAppContext::save_app_id(app_id.clone())?;
+                    info!("Using \"{app_id}\" app");
+                    Ok(())
+                }
+                CloudCommands::ApiRequestSamples { endpoint } => {
+                    cloud_client.print_api_request_samples(cloud, endpoint)
+                }
+            }
+        };
+
+        return match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                println!("{}", e);
+                Err(e)
+            }
+        };
+    }
+
+    let config = init_configuration(&cli, runtime.clone())?;
     // Now we have access to telemetry configuration. Telemetry must be initialized in tokio runtime.
-    let app_name = dozer.config.app_name.clone();
-    let app_id = dozer
-        .config
-        .cloud
-        .as_ref()
-        .map(|cloud| cloud.app_id.clone().unwrap_or(app_name));
+    let app_id = config.cloud.app_id.as_deref().unwrap_or(&config.app_name);
 
     // We always enable telemetry when running live.
     let telemetry_config = if matches!(cli.cmd, Commands::Live(_)) {
-        Some(TelemetryConfig {
+        TelemetryConfig {
             trace: None,
-            metrics: Some(TelemetryMetricsConfig::Prometheus(())),
-        })
+            metrics: Some(TelemetryMetricsConfig::Prometheus),
+        }
     } else {
-        dozer.config.telemetry.clone()
+        config.telemetry.clone()
     };
 
-    let _telemetry = dozer
-        .runtime
-        .block_on(async { Telemetry::new(app_id.as_deref(), telemetry_config) });
+    let _telemetry = runtime.block_on(async { Telemetry::new(Some(app_id), &telemetry_config) });
+
+    let mut dozer = init_dozer(
+        runtime.clone(),
+        config.clone(),
+        LabelsAndProgress::new(Default::default(), cli.enable_progress),
+    )
+    .map_err(OrchestrationError::CliError)?;
 
     // run individual servers
-    match cli.cmd {
+    (match cli.cmd {
         Commands::Run(run) => match run.command {
             Some(RunCommands::Api) => {
                 render_logo();
@@ -174,7 +236,7 @@ fn run() -> Result<(), OrchestrationError> {
         },
         Commands::Security(security) => match security.command {
             SecurityCommands::GenerateToken => {
-                let token = dozer.generate_token()?;
+                let token = dozer.generate_token(None)?;
                 info!("token: {:?} ", token);
                 Ok(())
             }
@@ -194,37 +256,8 @@ fn run() -> Result<(), OrchestrationError> {
         )),
         Commands::Clean => dozer.clean(),
         #[cfg(feature = "cloud")]
-        Commands::Cloud(cloud) => {
-            render_logo();
-
-            match cloud.command.clone() {
-                CloudCommands::Deploy(deploy) => dozer.deploy(cloud, deploy, cli.config_paths),
-                CloudCommands::Api(api) => dozer.api(cloud, api),
-                CloudCommands::Login {
-                    organisation_slug,
-                    profile_name,
-                    client_id,
-                    client_secret,
-                } => dozer.login(
-                    cloud,
-                    organisation_slug,
-                    profile_name,
-                    client_id,
-                    client_secret,
-                ),
-                CloudCommands::Secrets(command) => dozer.execute_secrets_command(cloud, command),
-                CloudCommands::Delete => dozer.delete(cloud),
-                CloudCommands::Status => dozer.status(cloud),
-                CloudCommands::Monitor => dozer.monitor(cloud),
-                CloudCommands::Logs(logs) => dozer.trace_logs(cloud, logs),
-                CloudCommands::Version(version) => dozer.version(cloud, version),
-                CloudCommands::List(list) => dozer.list(cloud, list),
-                CloudCommands::SetApp { app_id } => {
-                    CloudAppContext::save_app_id(app_id.clone())?;
-                    info!("Using \"{app_id}\" app");
-                    Ok(())
-                }
-            }
+        Commands::Cloud(_) => {
+            panic!("This should not happen as it is handled earlier");
         }
         Commands::Init => {
             panic!("This should not happen as it is handled in parse_and_generate");
@@ -238,64 +271,63 @@ fn run() -> Result<(), OrchestrationError> {
             ))?;
             Ok(())
         }
-    }
+    })
+    .map_err(|e| {
+        let _span = error_span!("OrchestrationError", error = %e);
+
+        e
+    })
 }
 
 // Some commands dont need to initialize the orchestrator
 // This function is used to run those commands
 fn parse_and_generate() -> Result<Cli, OrchestrationError> {
-    dozer_tracing::init_telemetry_closure(None, None, || -> Result<Cli, OrchestrationError> {
-        let cli = Cli::parse();
+    dozer_tracing::init_telemetry_closure(
+        None,
+        &Default::default(),
+        || -> Result<Cli, OrchestrationError> {
+            let cli = Cli::parse();
 
-        if let Commands::Init = cli.cmd {
-            Telemetry::new(None, None);
-            if let Err(e) = generate_config_repl() {
-                error!("{}", e);
-                Err(e)
+            if let Commands::Init = cli.cmd {
+                Telemetry::new(None, &Default::default());
+                if let Err(e) = generate_config_repl() {
+                    error!("{}", e);
+                    Err(e)
+                } else {
+                    // We need to exit here, otherwise the orchestrator will be initialized
+                    process::exit(0);
+                }
             } else {
-                // We need to exit here, otherwise the orchestrator will be initialized
-                process::exit(0);
+                Ok(cli)
             }
-        } else {
-            Ok(cli)
-        }
-    })
+        },
+    )
 }
 
-fn init_orchestrator(cli: &Cli) -> Result<SimpleOrchestrator, CliError> {
-    dozer_tracing::init_telemetry_closure(None, None, || -> Result<SimpleOrchestrator, CliError> {
-        let runtime = Arc::new(Runtime::new().map_err(CliError::FailedToCreateTokioRuntime)?);
-        let res = runtime.block_on(init_dozer(
-            runtime.clone(),
-            cli.config_paths.clone(),
-            cli.config_token.clone(),
-            cli.config_overrides.clone(),
-            cli.ignore_pipe,
-            LabelsAndProgress::new(Default::default(), cli.enable_progress),
-        ));
+fn init_configuration(cli: &Cli, runtime: Arc<Runtime>) -> Result<Config, CliError> {
+    dozer_tracing::init_telemetry_closure(
+        None,
+        &Default::default(),
+        || -> Result<Config, CliError> {
+            let res = runtime.block_on(init_config(
+                cli.config_paths.clone(),
+                cli.config_token.clone(),
+                cli.config_overrides.clone(),
+                cli.ignore_pipe,
+            ));
 
-        match res {
-            Ok(dozer) => {
-                dozer.runtime.spawn(check_update());
-                Ok(dozer)
-            }
-            Err(e) => {
-                if let CliError::FailedToFindConfigurationFiles(_) = &e {
-                    let description = "Dozer was not able to find configuration files. \n\n\
-                    Please use \"dozer init\" to create project or \"dozer -c {path}\" with path to your configuration.\n\
-                    Configuration documentation can be found in https://getdozer.io/docs/configuration";
-
-                    let mut command = Cli::command();
-                    command = command.about(format!("\n\n\n{} \n {}", LOGO, description));
-
-                    println!("{}", command.render_help());
+            match res {
+                Ok(config) => {
+                    runtime.spawn(check_update());
+                    Ok(config)
                 }
-
-                error!("{}", e);
-                Err(e)
+                Err(e) => {
+                    error!("{}", e);
+                    Err(e)
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 fn display_error(e: &OrchestrationError) {
@@ -313,7 +345,7 @@ fn display_error(e: &OrchestrationError) {
 struct Telemetry();
 
 impl Telemetry {
-    fn new(app_name: Option<&str>, config: Option<TelemetryConfig>) -> Self {
+    fn new(app_name: Option<&str>, config: &TelemetryConfig) -> Self {
         dozer_tracing::init_telemetry(app_name, config);
         Self()
     }

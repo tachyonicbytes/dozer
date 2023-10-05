@@ -67,15 +67,7 @@ impl S3Storage {
                     .map(|_| ());
             }
 
-            let mut delete = Delete::builder();
-            for object in objects {
-                delete = delete.objects(ObjectIdentifier::builder().key(object.key).build());
-            }
-            self.client
-                .delete_objects()
-                .bucket(&self.bucket_name)
-                .delete(delete.build())
-                .send()
+            self.delete_objects(objects.into_iter().map(|object| object.key).collect())
                 .await?;
         }
     }
@@ -220,9 +212,23 @@ impl Storage for S3Storage {
             .map(|output| output.body.map_err(Into::into).boxed())
             .map_err(Into::into)
     }
+
+    async fn delete_objects(&self, keys: Vec<String>) -> Result<(), Error> {
+        let mut delete = Delete::builder();
+        for key in keys {
+            delete = delete.objects(ObjectIdentifier::builder().key(key).build());
+        }
+        self.client
+            .delete_objects()
+            .bucket(&self.bucket_name)
+            .delete(delete.build())
+            .send()
+            .await?;
+        Ok(())
+    }
 }
 
-fn is_bucket_already_owned_by_you(error: &SdkError<CreateBucketError>) -> bool {
+fn is_bucket_already_owned_by_you<R>(error: &SdkError<CreateBucketError, R>) -> bool {
     if let SdkError::ServiceError(error) = error {
         error.err().is_bucket_already_owned_by_you()
     } else {

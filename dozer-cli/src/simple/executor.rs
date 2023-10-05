@@ -1,14 +1,14 @@
 use dozer_api::grpc::internal::internal_pipeline_server::LogEndpoint;
+use dozer_api::shutdown::ShutdownReceiver;
 use dozer_cache::dozer_log::camino::Utf8Path;
 use dozer_cache::dozer_log::home_dir::{BuildPath, HomeDir};
 use dozer_cache::dozer_log::replication::Log;
-use dozer_core::checkpoint::{CheckpointFactory, CheckpointFactoryOptions};
-use dozer_core::processor_record::ProcessorRecordStore;
+use dozer_core::checkpoint::{CheckpointOptions, OptionCheckpoint};
 use dozer_tracing::LabelsAndProgress;
 use dozer_types::models::api_endpoint::ApiEndpoint;
 use dozer_types::models::flags::Flags;
-use dozer_types::parking_lot::Mutex;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -16,7 +16,6 @@ use dozer_types::models::source::Source;
 use dozer_types::models::udf_config::UdfConfig;
 
 use crate::pipeline::PipelineBuilder;
-use crate::shutdown::ShutdownReceiver;
 use dozer_core::executor::{DagExecutor, ExecutorOptions};
 
 use dozer_types::models::connection::Connection;
@@ -29,7 +28,7 @@ pub struct Executor<'a> {
     connections: &'a [Connection],
     sources: &'a [Source],
     sql: Option<&'a str>,
-    checkpoint_factory: Arc<CheckpointFactory>,
+    checkpoint: OptionCheckpoint,
     /// `ApiEndpoint` and its log.
     endpoint_and_logs: Vec<(ApiEndpoint, LogEndpoint)>,
     labels: LabelsAndProgress,
@@ -47,7 +46,7 @@ impl<'a> Executor<'a> {
         sources: &'a [Source],
         sql: Option<&'a str>,
         api_endpoints: &'a [ApiEndpoint],
-        checkpoint_factory_options: CheckpointFactoryOptions,
+        checkpoint_options: CheckpointOptions,
         labels: LabelsAndProgress,
         udfs: &'a [UdfConfig],
     ) -> Result<Executor<'a>, OrchestrationError> {
@@ -58,20 +57,19 @@ impl<'a> Executor<'a> {
             .ok_or(OrchestrationError::NoBuildFound)?;
 
         // Load pipeline checkpoint.
-        let record_store = ProcessorRecordStore::new()?;
-        let checkpoint_factory = CheckpointFactory::new(
-            Arc::new(record_store),
-            build_path.data_dir.to_string(),
-            checkpoint_factory_options,
-        )
-        .await?
-        .0;
+        let checkpoint =
+            OptionCheckpoint::new(build_path.data_dir.to_string(), checkpoint_options).await?;
 
         let mut endpoint_and_logs = vec![];
         for endpoint in api_endpoints {
-            let log_endpoint =
-                create_log_endpoint(contract, &build_path, &endpoint.name, &checkpoint_factory)
-                    .await?;
+            let log_endpoint = create_log_endpoint(
+                contract,
+                &build_path,
+                &endpoint.name,
+                &checkpoint,
+                checkpoint.num_slices(),
+            )
+            .await?;
             endpoint_and_logs.push((endpoint.clone(), log_endpoint));
         }
 
@@ -79,7 +77,7 @@ impl<'a> Executor<'a> {
             connections,
             sources,
             sql,
-            checkpoint_factory: Arc::new(checkpoint_factory),
+            checkpoint,
             endpoint_and_logs,
             labels,
             udfs,
@@ -91,7 +89,7 @@ impl<'a> Executor<'a> {
     }
 
     pub async fn create_dag_executor(
-        &self,
+        self,
         runtime: &Arc<Runtime>,
         executor_options: ExecutorOptions,
         shutdown: ShutdownReceiver,
@@ -102,8 +100,8 @@ impl<'a> Executor<'a> {
             self.sources,
             self.sql,
             self.endpoint_and_logs
-                .iter()
-                .map(|(endpoint, log)| (endpoint.clone(), Some(log.log.clone())))
+                .into_iter()
+                .map(|(endpoint, log)| (endpoint, Some(log.log)))
                 .collect(),
             self.labels.clone(),
             flags,
@@ -111,7 +109,7 @@ impl<'a> Executor<'a> {
         );
 
         let dag = builder.build(runtime, shutdown).await?;
-        let exec = DagExecutor::new(dag, self.checkpoint_factory.clone(), executor_options)?;
+        let exec = DagExecutor::new(dag, self.checkpoint, executor_options).await?;
 
         Ok(exec)
     }
@@ -132,7 +130,8 @@ async fn create_log_endpoint(
     contract: &Contract,
     build_path: &BuildPath,
     endpoint_name: &str,
-    checkpoint_factory: &CheckpointFactory,
+    checkpoint: &OptionCheckpoint,
+    num_persisted_entries_to_keep: usize,
 ) -> Result<LogEndpoint, OrchestrationError> {
     let endpoint_path = build_path.get_endpoint_path(endpoint_name);
 
@@ -149,9 +148,14 @@ async fn create_log_endpoint(
             OrchestrationError::FileSystem(build_path.descriptor_path.clone().into(), e)
         })?;
 
-    let log_prefix = AsRef::<Utf8Path>::as_ref(checkpoint_factory.prefix())
+    let log_prefix = AsRef::<Utf8Path>::as_ref(checkpoint.prefix())
         .join(&endpoint_path.log_dir_relative_to_data_dir);
-    let log = Log::new(checkpoint_factory.storage(), log_prefix.into(), false).await?;
+    let log = Log::new(
+        checkpoint.storage(),
+        log_prefix.into(),
+        num_persisted_entries_to_keep,
+    )
+    .await?;
     let log = Arc::new(Mutex::new(log));
 
     Ok(LogEndpoint {

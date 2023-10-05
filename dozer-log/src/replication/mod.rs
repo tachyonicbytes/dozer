@@ -3,16 +3,15 @@ use std::ops::{DerefMut, Range};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use camino::Utf8Path;
 use dozer_types::grpc_types::internal::storage_response;
 use dozer_types::log::{debug, error};
-use dozer_types::parking_lot::Mutex;
 use dozer_types::serde::{Deserialize, Serialize};
 use dozer_types::types::Operation;
 use dozer_types::{bincode, thiserror};
 use pin_project::pin_project;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::storage::{Queue, Storage};
@@ -32,8 +31,8 @@ pub struct PersistedLogEntry {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Non-empty writable log")]
-    NonEmptyWritableLog,
+    #[error("`CheckpointFactory` expects {expected} checkpoints but only {actual} found")]
+    NotEnoughLogEntries { expected: usize, actual: usize },
     #[error("Storage error: {0}")]
     Storage(#[from] super::storage::Error),
     #[error("Unrecognized log entry: {0}")]
@@ -92,26 +91,12 @@ impl Log {
 
     pub async fn new(
         storage: &dyn Storage,
-        mut prefix: String,
-        readonly: bool,
+        prefix: String,
+        num_persisted_entries_to_keep: usize,
     ) -> Result<Self, Error> {
-        if !readonly {
-            // Right now we don't support appending to an existing log, because the pipeline doesn't support restart yet.
-            // So we write a marker file to every log to mark it as "dirty" and should not be reused.
-            let marker_file = AsRef::<Utf8Path>::as_ref(&prefix).join("marker");
-            if !storage
-                .list_objects(marker_file.clone().into(), None)
-                .await?
-                .objects
-                .is_empty()
-            {
-                return Err(Error::NonEmptyWritableLog);
-            }
-            storage.put_object(marker_file.into(), vec![]).await?;
-        }
-
-        prefix = AsRef::<Utf8Path>::as_ref(&prefix).join("data").into();
-        let persisted = load_persisted_log_entries(storage, prefix.clone()).await?;
+        let persisted =
+            load_persisted_log_entries(storage, prefix.clone(), num_persisted_entries_to_keep)
+                .await?;
         let end = persisted_log_entries_end(&persisted);
 
         let in_memory = InMemoryLog {
@@ -131,7 +116,12 @@ impl Log {
         })
     }
 
-    pub fn write(&mut self, op: LogOperation) {
+    pub fn end(&self) -> usize {
+        self.in_memory.end()
+    }
+
+    /// Returns the log length after this write.
+    pub fn write(&mut self, op: LogOperation) -> usize {
         // Record operation.
         self.in_memory.ops.push(op);
 
@@ -149,6 +139,8 @@ impl Log {
                 true
             }
         });
+
+        self.end()
     }
 
     pub fn persist(
@@ -180,7 +172,7 @@ impl Log {
                 }
             };
 
-            let mut this = this.lock();
+            let mut this = this.lock().await;
             let this = this.deref_mut();
             debug_assert!(persisted_log_entries_end(&this.persisted).unwrap_or(0) == range.start);
             debug_assert!(this.in_memory.start == range.start);
@@ -209,7 +201,9 @@ impl Log {
     }
 
     /// Returned `LogResponse` is guaranteed to contain `request.start`, but may actually contain less then `request.end`.
-    pub fn read(
+    ///
+    /// Function is marked as `async` because it needs to run in a tokio runtime.
+    pub async fn read(
         &mut self,
         request: Range<usize>,
         timeout: Duration,
@@ -241,7 +235,7 @@ impl Log {
         tokio::spawn(async move {
             // Try to trigger watcher when timeout.
             tokio::time::sleep(timeout).await;
-            let mut this = this.lock();
+            let mut this = this.lock().await;
             let this = this.deref_mut();
             // Find the watcher. It may have been triggered by slice fulfillment or persisting.
             if let Some((index, watcher)) = this

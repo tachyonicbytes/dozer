@@ -1,51 +1,27 @@
 use prettytable::Table as PrettyTable;
-use std::fmt::Debug;
+use schemars::JsonSchema;
+use std::{fmt::Debug, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::{
-    errors::internal::BoxedError, models::api_config::AppGrpcOptions, node::OpIdentifier,
+    helper::{deserialize_duration_secs_f64, f64_schema, serialize_duration_secs_f64},
+    node::OpIdentifier,
     types::Operation,
 };
 
-#[derive(Debug, Clone, PartialEq)]
-/// Messages that connectors send to Dozer.
-pub struct IngestionMessage {
-    /// The message's identifier, must be unique in a connector.
-    pub identifier: OpIdentifier,
-    /// The message kind.
-    pub kind: IngestionMessageKind,
-}
-
-impl IngestionMessage {
-    pub fn new_op(txn: u64, seq_no: u64, table_index: usize, op: Operation) -> Self {
-        Self {
-            identifier: OpIdentifier::new(txn, seq_no),
-            kind: IngestionMessageKind::OperationEvent { table_index, op },
-        }
-    }
-
-    pub fn new_snapshotting_done(txn: u64, seq_no: u64) -> Self {
-        Self {
-            identifier: OpIdentifier::new(txn, seq_no),
-            kind: IngestionMessageKind::SnapshottingDone,
-        }
-    }
-
-    pub fn new_snapshotting_started(txn: u64, seq_no: u64) -> Self {
-        Self {
-            identifier: OpIdentifier::new(txn, seq_no),
-            kind: IngestionMessageKind::SnapshottingStarted,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 /// All possible kinds of `IngestionMessage`.
-pub enum IngestionMessageKind {
+pub enum IngestionMessage {
     /// A CDC event.
-    OperationEvent { table_index: usize, op: Operation },
+    OperationEvent {
+        /// Index of the table that the event belongs to.
+        table_index: usize,
+        /// The CDC event.
+        op: Operation,
+        /// If this connector supports restarting from a specific CDC event, it should provide an identifier.
+        id: Option<OpIdentifier>,
+    },
     /// A connector uses this message kind to notify Dozer that a initial snapshot of the source tables is started
     SnapshottingStarted,
     /// A connector uses this message kind to notify Dozer that a initial snapshot of the source tables is done,
@@ -53,106 +29,87 @@ pub enum IngestionMessageKind {
     SnapshottingDone,
 }
 
-#[derive(Error, Debug)]
-pub enum IngestorError {
-    #[error("Failed to send message on channel")]
-    ChannelError(#[from] BoxedError),
-}
-
-pub trait IngestorForwarder: Send + Sync + Debug {
-    fn forward(&self, msg: IngestionMessage) -> Result<(), IngestorError>;
-}
-
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema, Default)]
 pub struct EthFilter {
     // Starting block
-    #[prost(uint64, optional, tag = "1")]
     pub from_block: Option<u64>,
-    #[prost(uint64, optional, tag = "2")]
+
     pub to_block: Option<u64>,
-    #[prost(string, repeated, tag = "3")]
+
     #[serde(default)]
     pub addresses: Vec<String>,
-    #[prost(string, repeated, tag = "4")]
+
     #[serde(default)]
     pub topics: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct GrpcConfig {
-    #[prost(string, tag = "1", default = "0.0.0.0")]
-    #[serde(default = "default_ingest_host")]
-    pub host: String,
-    #[prost(uint32, tag = "2", default = "8085")]
-    #[serde(default = "default_ingest_port")]
-    pub port: u32,
-    #[prost(oneof = "GrpcConfigSchemas", tags = "3,4")]
-    pub schemas: Option<GrpcConfigSchemas>,
-    #[prost(string, tag = "5", default = "default")]
-    #[serde(default = "default_grpc_adapter")]
-    pub adapter: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u32>,
+
+    pub schemas: GrpcConfigSchemas,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
 }
 
-fn default_grpc_adapter() -> String {
+pub fn default_grpc_adapter() -> String {
     "default".to_owned()
 }
 
-fn default_ingest_host() -> String {
+pub fn default_ingest_host() -> String {
     "0.0.0.0".to_owned()
 }
 
-fn default_ingest_port() -> u32 {
+pub fn default_ingest_port() -> u32 {
     8085
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Oneof, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub enum GrpcConfigSchemas {
-    #[prost(string, tag = "3")]
     Inline(String),
-    #[prost(string, tag = "4")]
     Path(String),
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema, Default)]
 pub struct EthConfig {
-    #[prost(oneof = "EthProviderConfig", tags = "2,3")]
     pub provider: Option<EthProviderConfig>,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Oneof, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub enum EthProviderConfig {
-    #[prost(message, tag = "2")]
     Log(EthLogConfig),
-    #[prost(message, tag = "3")]
+
     Trace(EthTraceConfig),
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema, Default)]
 pub struct EthLogConfig {
-    #[prost(string, tag = "1")]
     pub wss_url: String,
-    #[prost(message, optional, tag = "2")]
+
     pub filter: Option<EthFilter>,
-    #[prost(message, repeated, tag = "3")]
+
     #[serde(default)]
     pub contracts: Vec<EthContract>,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema, Default)]
 pub struct EthTraceConfig {
-    #[prost(string, tag = "1")]
     pub https_url: String,
     // Starting block
-    #[prost(uint64, tag = "2")]
     pub from_block: u64,
-    #[prost(uint64, optional, tag = "3")]
+
     pub to_block: Option<u64>,
-    #[prost(uint64, tag = "4", default = "3")]
-    #[serde(default = "default_batch_size")]
-    pub batch_size: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<u64>,
 }
 
-fn default_batch_size() -> u64 {
+pub fn default_batch_size() -> u64 {
     3
 }
 
@@ -182,21 +139,19 @@ impl EthConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct EthContract {
-    #[prost(string, tag = "1")]
     pub name: String,
-    #[prost(string, tag = "2")]
+
     pub address: String,
-    #[prost(string, tag = "3")]
+
     pub abi: String,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct KafkaConfig {
-    #[prost(string, tag = "1")]
     pub broker: String,
-    #[prost(string, optional, tag = "3")]
+
     pub schema_registry_url: Option<String>,
 }
 
@@ -214,26 +169,34 @@ impl KafkaConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct SnowflakeConfig {
-    #[prost(string, tag = "1")]
     pub server: String,
-    #[prost(string, tag = "2")]
+
     pub port: String,
-    #[prost(string, tag = "3")]
+
     pub user: String,
-    #[prost(string, tag = "4")]
+
     pub password: String,
-    #[prost(string, tag = "5")]
+
     pub database: String,
-    #[prost(string, tag = "6")]
+
     pub schema: String,
-    #[prost(string, tag = "7")]
+
     pub warehouse: String,
-    #[prost(string, optional, tag = "8")]
+
     pub driver: Option<String>,
-    #[prost(string, default = "PUBLIC", tag = "9")]
+
     pub role: String,
+
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_duration_secs_f64",
+        serialize_with = "serialize_duration_secs_f64"
+    )]
+    #[schemars(schema_with = "f64_schema")]
+    pub poll_interval_seconds: Option<Duration>,
 }
 
 impl SnowflakeConfig {
@@ -247,20 +210,28 @@ impl SnowflakeConfig {
             ["database", self.database],
             ["schema", self.schema],
             ["warehouse", self.warehouse],
-            ["driver", self.driver.as_ref().map_or("default", |d| d)]
+            ["driver", self.driver.as_ref().map_or("default", |d| d)],
+            [
+                "poll_interval_seconds",
+                format!(
+                    "{}s",
+                    self.poll_interval_seconds
+                        .unwrap_or_else(default_snowflake_poll_interval)
+                        .as_secs_f64()
+                )
+            ]
         )
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct DataFusionConfig {
-    #[prost(string, tag = "1")]
     pub access_key_id: String,
-    #[prost(string, tag = "2")]
+
     pub secret_access_key: String,
-    #[prost(string, tag = "3")]
+
     pub region: String,
-    #[prost(string, tag = "4")]
+
     pub bucket_name: String,
 }
 
@@ -275,87 +246,74 @@ impl DataFusionConfig {
     }
 }
 
-// #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+// #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone,  Hash, JsonSchema)]
 // pub struct Table {
-//     #[prost(string, tag = "1")]
+//
 //     pub name: String,
-//     #[prost(string, tag = "2")]
+//
 //     pub prefix: String,
-//     #[prost(string, tag = "3")]
+//
 //     pub file_type: String,
-//     #[prost(string, tag = "4")]
+//
 //     pub extension: String,
 // }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct Table {
-    #[prost(oneof = "TableConfig", tags = "1,2,3")]
     pub config: Option<TableConfig>,
-    #[prost(string, tag = "4")]
+
     pub name: String,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Oneof, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub enum TableConfig {
-    #[prost(message, tag = "1")]
     CSV(CsvConfig),
-    #[prost(message, tag = "2")]
+
     Delta(DeltaConfig),
-    #[prost(message, tag = "3")]
+
     Parquet(ParquetConfig),
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct CsvConfig {
-    #[prost(string, tag = "1")]
     pub path: String,
-    #[prost(string, tag = "2")]
+
     pub extension: String,
-    #[prost(bool, tag = "3")]
-    #[serde(default = "default_false")]
-    pub marker_file: bool,
-    #[prost(string, tag = "4")]
-    #[serde(default = "default_marker")]
-    pub marker_extension: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker_extension: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct DeltaConfig {
-    #[prost(string, tag = "1")]
     pub path: String,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct ParquetConfig {
-    #[prost(string, tag = "1")]
     pub path: String,
-    #[prost(string, tag = "2")]
+
     pub extension: String,
-    #[prost(bool, tag = "3")]
-    #[serde(default = "default_false")]
-    pub marker_file: bool,
-    #[prost(string, tag = "4")]
-    #[serde(default = "default_marker")]
-    pub marker_extension: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker_extension: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct S3Details {
-    #[prost(string, tag = "1")]
     pub access_key_id: String,
-    #[prost(string, tag = "2")]
+
     pub secret_access_key: String,
-    #[prost(string, tag = "3")]
+
     pub region: String,
-    #[prost(string, tag = "4")]
+
     pub bucket_name: String,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct S3Storage {
-    #[prost(message, optional, tag = "1")]
     pub details: Option<S3Details>,
-    #[prost(message, repeated, tag = "2")]
+
     pub tables: Vec<Table>,
 }
 
@@ -375,17 +333,15 @@ impl S3Storage {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct LocalDetails {
-    #[prost(string, tag = "1")]
     pub path: String,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct LocalStorage {
-    #[prost(message, optional, tag = "1")]
     pub details: Option<LocalDetails>,
-    #[prost(message, repeated, tag = "2")]
+
     pub tables: Vec<Table>,
 }
 
@@ -397,11 +353,10 @@ impl LocalStorage {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct DeltaTable {
-    #[prost(string, tag = "1")]
     pub path: String,
-    #[prost(string, tag = "2")]
+
     pub name: String,
 }
 
@@ -411,71 +366,54 @@ impl DeltaTable {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct DeltaLakeConfig {
-    #[prost(message, repeated, tag = "1")]
     pub tables: Vec<DeltaTable>,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct MongodbConfig {
-    #[prost(string, tag = "1")]
     pub connection_string: String,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct MySQLConfig {
-    #[prost(string, tag = "1")]
     pub url: String,
-    #[prost(uint32, optional, tag = "2")]
+
     pub server_id: Option<u32>,
 }
 
-fn default_false() -> bool {
-    false
-}
-
-fn default_marker() -> String {
-    String::from(".marker")
-}
-
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema)]
 pub struct NestedDozerConfig {
-    #[prost(message, tag = "1")]
-    pub grpc: Option<AppGrpcOptions>,
-
-    #[prost(message, tag = "2")]
-    pub log_options: Option<NestedDozerLogOptions>,
+    pub url: String,
+    #[serde(default)]
+    pub log_options: NestedDozerLogOptions,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, ::prost::Message, Hash)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone, Hash, JsonSchema, Default)]
 pub struct NestedDozerLogOptions {
-    #[prost(uint32, tag = "2")]
-    #[serde(default = "default_log_batch_size")]
-    pub batch_size: u32,
-    #[prost(uint32, tag = "3")]
-    #[serde(default = "default_timeout")]
-    pub timeout_in_millis: u32,
-    #[prost(uint32, tag = "4")]
-    #[serde(default = "default_buffer_size")]
-    pub buffer_size: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_in_millis: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_size: Option<u32>,
 }
 
-fn default_log_batch_size() -> u32 {
+pub fn default_log_batch_size() -> u32 {
     30
 }
-fn default_timeout() -> u32 {
+
+pub fn default_timeout() -> u32 {
     1000
 }
 
-fn default_buffer_size() -> u32 {
+pub fn default_buffer_size() -> u32 {
     1000
 }
 
-pub fn default_log_options() -> NestedDozerLogOptions {
-    NestedDozerLogOptions {
-        batch_size: default_log_batch_size(),
-        timeout_in_millis: default_timeout(),
-        buffer_size: default_buffer_size(),
-    }
+pub fn default_snowflake_poll_interval() -> Duration {
+    Duration::from_secs(60)
 }

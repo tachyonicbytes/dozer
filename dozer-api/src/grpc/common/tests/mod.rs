@@ -11,13 +11,13 @@ use dozer_types::grpc_types::{
         value, EventFilter, EventType, FieldDefinition, OperationType, RecordWithId, Type, Value,
     },
 };
-use tonic::Request;
+use dozer_types::tonic::Request;
 
 use super::CommonService;
 
 async fn setup_common_service() -> CommonService {
     let (endpoints, rx1) = setup_pipeline().await;
-    CommonService::new(endpoints, Some(rx1))
+    CommonService::new(endpoints, Some(rx1), 50)
 }
 
 async fn count_and_query(

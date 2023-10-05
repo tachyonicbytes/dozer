@@ -17,17 +17,20 @@ use crate::{
     CacheEndpoint,
 };
 use dozer_cache::CacheReader;
+use dozer_types::tonic::{
+    self,
+    codegen::{
+        self, empty_body, Body, BoxFuture, Context, EnabledCompressionEncodings, Poll, StdError,
+    },
+    metadata::MetadataMap,
+    Code, Extensions, Request, Response, Status,
+};
 use dozer_types::{grpc_types::types::Operation, models::api_security::ApiSecurity};
 use dozer_types::{log::error, types::Schema};
 use futures_util::future;
 use prost_reflect::{MethodDescriptor, Value};
-use std::{borrow::Cow, collections::HashMap, convert::Infallible};
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, sync::Arc};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{
-    codegen::{self, *},
-    metadata::MetadataMap,
-    Code, Extensions, Request, Response, Status,
-};
 
 #[derive(Debug, Clone)]
 struct TypedEndpoint {
@@ -42,6 +45,7 @@ pub struct TypedService {
     endpoint_map: HashMap<String, TypedEndpoint>,
     event_notifier: Option<tokio::sync::broadcast::Receiver<Operation>>,
     security: Option<ApiSecurity>,
+    default_max_num_records: usize,
 }
 
 impl Clone for TypedService {
@@ -52,6 +56,7 @@ impl Clone for TypedService {
             endpoint_map: self.endpoint_map.clone(),
             event_notifier: self.event_notifier.as_ref().map(|r| r.resubscribe()),
             security: self.security.to_owned(),
+            default_max_num_records: self.default_max_num_records,
         }
     }
 }
@@ -61,6 +66,7 @@ impl TypedService {
         cache_endpoints: Vec<Arc<CacheEndpoint>>,
         event_notifier: Option<tokio::sync::broadcast::Receiver<Operation>>,
         security: Option<ApiSecurity>,
+        default_max_num_records: usize,
     ) -> Result<Self, ApiInitError> {
         let endpoint_map = cache_endpoints
             .into_iter()
@@ -84,6 +90,7 @@ impl TypedService {
             endpoint_map,
             event_notifier,
             security,
+            default_max_num_records,
         })
     }
 
@@ -106,7 +113,7 @@ impl TypedService {
         if current_path.len() != 3 {
             return None;
         }
-
+        let default_max_num_records = self.default_max_num_records;
         let full_service_name = current_path[1];
         let typed_endpoint = self.endpoint_map.get(full_service_name)?;
 
@@ -145,6 +152,7 @@ impl TypedService {
             struct QueryService {
                 cache_endpoint: Arc<CacheEndpoint>,
                 response_desc: Option<QueryResponseDesc>,
+                default_max_num_records: usize,
             }
             impl tonic::server::UnaryService<DynamicMessage> for QueryService {
                 type Response = TypedResponse;
@@ -157,6 +165,7 @@ impl TypedService {
                         self.response_desc
                             .take()
                             .expect("This future shouldn't be polled twice"),
+                        self.default_max_num_records,
                     );
                     future::ready(response)
                 }
@@ -166,6 +175,7 @@ impl TypedService {
             let method = QueryService {
                 cache_endpoint: typed_endpoint.cache_endpoint.clone(),
                 response_desc: Some(typed_endpoint.service_desc.query.response_desc.clone()),
+                default_max_num_records,
             };
             Some(Box::pin(async move {
                 let res = grpc.unary(method, req).await;
@@ -325,11 +335,18 @@ fn query(
     reader: &CacheReader,
     endpoint: &str,
     response_desc: QueryResponseDesc,
+    default_max_num_records: usize,
 ) -> Result<Response<TypedResponse>, Status> {
     let mut parts = request.into_parts();
     let (query, access) = parse_request(&mut parts)?;
 
-    let records = shared_impl::query(reader, query.as_deref(), endpoint, access)?;
+    let records = shared_impl::query(
+        reader,
+        query.as_deref(),
+        endpoint,
+        access,
+        default_max_num_records,
+    )?;
     let res = query_response_to_typed_response(records, response_desc).map_err(|e| {
         error!("Query API error: {:?}", e);
         Status::internal("Query API error")

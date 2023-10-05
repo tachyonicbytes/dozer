@@ -9,13 +9,12 @@ use std::{
 
 use crate::{
     builder_dag::{BuilderDag, NodeKind, NodeType},
-    epoch::EpochManager,
+    epoch::{EpochManager, EpochManagerOptions},
     error_manager::ErrorManager,
     errors::ExecutionError,
     executor_operation::ExecutorOperation,
     hash_map_to_vec::insert_vec_element,
     node::PortHandle,
-    processor_record::ProcessorRecordStore,
     record_store::{create_record_writer, RecordWriter},
 };
 use crossbeam::channel::{bounded, Receiver, Sender};
@@ -23,6 +22,7 @@ use daggy::petgraph::{
     visit::{EdgeRef, IntoEdges, IntoEdgesDirected, IntoNodeIdentifiers},
     Direction,
 };
+use dozer_recordstore::ProcessorRecordStore;
 use dozer_tracing::LabelsAndProgress;
 
 pub type SharedRecordWriter = Rc<RefCell<Option<Box<dyn RecordWriter>>>>;
@@ -56,6 +56,7 @@ impl ExecutionDag {
         labels: LabelsAndProgress,
         channel_buffer_sz: usize,
         error_threshold: Option<u32>,
+        epoch_manager_options: EpochManagerOptions,
     ) -> Result<Self, ExecutionError> {
         // Count number of sources.
         let num_sources = builder_dag
@@ -64,7 +65,7 @@ impl ExecutionDag {
             .filter(|node_index| {
                 matches!(
                     builder_dag.graph()[*node_index].kind,
-                    NodeKind::Source(_, _)
+                    NodeKind::Source { .. }
                 )
             })
             .count();
@@ -120,8 +121,9 @@ impl ExecutionDag {
         // Create new graph.
         let epoch_manager = Arc::new(EpochManager::new(
             num_sources,
+            builder_dag.initial_epoch_id(),
             checkpoint_factory.clone(),
-            Default::default(),
+            epoch_manager_options,
         ));
         let graph = builder_dag.into_graph().map_owned(
             |_, node| Some(node),
